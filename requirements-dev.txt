@@ -1,0 +1,17 @@
+# Dev/test dependencies. Enough to run `pytest tests/` on a laptop with no GPU.
+#
+# torch, transformers and huggingface_hub are needed by `test_batch_engine.py`: the cache
+# gather is tensor indexing, so it cannot be stubbed, and `strands_decider.batch_engine`
+# imports through `infer` -> `modeling`. CPU wheels are fine; no GPU is touched. Without
+# them that module `importorskip`s itself and 17 tests silently pass as a skip, which is
+# worse than failing -- the gather is the part that, if wrong, answers one caller's
+# question from another caller's state.
+pytest>=8.0
+ruff>=0.6
+pydantic>=2.7
+numpy>=1.24
+fastapi>=0.115
+boto3>=1.34
+torch>=2.5
+transformers>=4.40
+huggingface_hub>=0.23

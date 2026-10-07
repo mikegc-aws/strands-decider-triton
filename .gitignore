@@ -1,0 +1,21 @@
+# Local dev environment. ~973 MB, and recreated by:
+#   python -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
+.venv/
+venv/
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# macOS. AppleDouble files are not merely noise here: a stray `._decider` next to
+# `decider/` in the build context makes Triton try to load it as a second model and the
+# whole server fails to start. deploy/build_on_box.sh and Dockerfile.triton both strip
+# them as well, because this file cannot protect a context built from an export.
+.DS_Store
+._*
+
+# Build/benchmark scratch. Results that matter are archived to
+# s3://hobson-v17-680624154995-us-west-2/results/serving/ and quoted in the docs.
+*.log
+/tmp/

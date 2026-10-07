@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "strands-decider-triton"
+version = "0.1.0"
+description = "Triton Inference Server backend for strands-decider-2B, hosted on AWS SageMaker."
+readme = "README.md"
+requires-python = ">=3.10"
+# The runtime image installs these itself, with versions pinned and asserted at build time
+# (deploy/Dockerfile.triton) -- torch in particular must be 2.7.1+cu126. These ranges are
+# for a local install; do not treat them as the deployed versions.
+dependencies = [
+    "torch>=2.7",
+    "transformers>=5.18,<6",
+    "huggingface_hub>=1.5",
+    "pydantic>=2.7",
+    "numpy>=1.24",
+    "safetensors>=0.4",
+    "accelerate>=0.34",
+]
+
+[project.optional-dependencies]
+# The FastAPI path in server.py/scheduler.py, for running without Triton.
+server = ["fastapi>=0.115", "uvicorn[standard]>=0.30"]
+# The build-time LoRA merge (serving/merge_lora.py) only. Deliberately absent from the
+# runtime image so a checkpoint cannot be served unmerged by accident.
+merge = ["peft>=0.21"]
+# `--device mlx`: the torso on Apple silicon through mlx-lm. Pinned to the tested minor
+# version because the backend uses its Qwen3.5 module layout and prompt-cache internals.
+mlx = [
+    "mlx>=0.32.2; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "mlx-lm>=0.32,<0.33; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+# Correctness, import hygiene, and pyupgrade (PEP 585 / PEP 604) modernisation.
+select = ["E", "F", "I", "W", "B", "SLF", "RUF", "UP"]
+ignore = [
+    "B008",    # callable defaults are idiomatic in the CLI/API layers
+    "E501",    # line length is handled by the formatter
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["SLF001"]   # tests legitimately assert on internal invariants
+"tools/*" = ["SLF001"]   # the harnesses read engine internals, as the tests do
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,137 @@
+# Triton model config for the Decider's System One API.
+#
+# The request and response are JSON, one string tensor each, rather than a tensor per
+# field. That is deliberate: a System One request is a state plus an arbitrary dict of
+# typed questions whose option lists vary per request and per question, which does not
+# express as a fixed tensor schema. Keeping the wire format identical to
+# `POST /v1/systemone` also means existing clients and JevBench's `typesafe` adapter work
+# against this unchanged -- see wire.py.
+#
+# WHY TRITON IS HERE AT ALL, since the package already has a bounded-queue scheduler:
+# cross-request batching. `scheduler.py` drains a batch and then evaluates it one entry at
+# a time -- its own docstring calls the drain "the seam a future cross-request batched
+# forward pass slots into. It is NOT yet a shared forward pass." That is the measured
+# ceiling on the torch path: 12 req/s at 1 worker, and *worse* at 4 (5.2) and 8 (3.8).
+# Triton's dynamic batcher is that missing piece, maintained rather than hand-rolled.
+#
+# This is for the MERGED HF ENGINE ONLY. vLLM batches internally across its own scheduler,
+# so putting a second batching queue in front of it would add latency for nothing. The
+# vLLM deployable keeps the FastAPI + Scheduler path.
+
+name: "decider"
+backend: "python"
+
+# Requests the dynamic batcher may coalesce into one execute() call.
+#
+# 8 is now MEASURED, not a starting point. With cross-request batching in the backend
+# (`evaluate_many`), 8 requests x 7 questions = 56 question rows, which fits
+# `BatchedSystemOneEngine.max_rows` (128) in a single pass pair. Raising this to 32 was
+# tried and is WORSE -- 56 decisions/s at concurrency 32 against 101.5 at
+# max_batch_size 8, with server p50 going 611 ms -> 2,031 ms. The Triton log shows why:
+# it occasionally forms batches of 26 requests (182 rows), which exceeds max_rows, gets
+# chunked into two pass pairs anyway, and so buys no extra amortisation while adding
+# queueing delay and activation memory.
+#
+# So the rule is: max_batch_size * typical questions per request should land at or just
+# under max_rows. If callers routinely send 14 questions, drop this to 8 and raise
+# max_rows, or drop this to 4.
+max_batch_size: 8
+
+input [
+  {
+    # A SystemOneRequest as JSON bytes. dims [1] so every request has an identical shape,
+    # which is what lets the dynamic batcher coalesce them at all -- a ragged tensor input
+    # would force separate batches.
+    name: "REQUEST_JSON"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+  }
+]
+
+output [
+  {
+    # A SystemOneResponse as JSON bytes, plus latency_ms, matching /v1/systemone exactly.
+    name: "RESPONSE_JSON"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+  }
+]
+
+dynamic_batching {
+  # Try to fill 4 then 8. Preferred sizes are a hint; Triton still dispatches a smaller
+  # batch once the queue delay expires.
+  preferred_batch_size: [ 4, 8 ]
+
+  # 2 ms. The number worth understanding rather than copying: this is pure added latency
+  # for a request that arrives into an empty queue, so it must stay small relative to the
+  # work. The fastest measured request on this model is ~67 ms, so 2 ms is ~3% worst-case
+  # latency cost in exchange for batching under load. Raising it buys wider batches at
+  # proportionally more tail latency; 100ms+ (a common copy-paste default) would dominate
+  # the request itself here.
+  max_queue_delay_microseconds: 2000
+
+  # Preserve arrival order so one slow neighbour cannot starve an earlier request.
+  preserve_ordering: false
+
+  default_queue_policy {
+    # Bound the queue and shed rather than let overload become unbounded latency -- the
+    # same reasoning as SchedulerConfig.max_queue, which this replaces. Full means the
+    # request is rejected immediately, which a load balancer can act on; an unbounded
+    # queue looks like a hang to every caller instead of a clear refusal to one.
+    timeout_action: REJECT
+    default_timeout_microseconds: 30000000
+    allow_timeout_override: true
+    max_queue_size: 256
+  }
+}
+
+instance_group [
+  {
+    # Model copies per GPU. The model is ~5 GB bf16 on a 24 GB L4, so several fit, and
+    # this is the "scale out with processes" that scheduler.py recommends but leaves to
+    # the operator. Each instance is a separate python stub process with its own copy of
+    # the weights, so raise this with memory in mind: count * (weights + activations).
+    #
+    # Starts at 1. With dynamic batching doing the coalescing, a second instance helps
+    # only once one instance cannot saturate the GPU -- and that is a measurement
+    # (Phase 6), not a guess.
+    count: 1
+    kind: KIND_GPU
+  }
+]
+
+# NOTE on warm-up: it is done inside model.py's initialize(), NOT via Triton's
+# `model_warmup` block. Two reasons.
+#
+# First, `model_warmup` with `input_data_file` wants a TYPE_STRING file in Triton's own
+# 4-byte-length-prefixed binary layout; getting that subtly wrong means the model fails to
+# load, and it buys nothing here.
+#
+# Second and more important, one warm-up request is not enough for this model. The Gated
+# DeltaNet layers' kernels compile per *shape*, and the two readout paths are different
+# code: a single question takes the plain batched path, several take the shared-prefix
+# path. Warming one shape leaves a real caller to compile the rest -- measured 54.2 s cold
+# against ~67 ms steady state. initialize() therefore sweeps several state lengths across
+# both paths, mirroring strands_decider.scheduler.Scheduler.warmup, and Triton does not
+# mark the model ready until it returns.
+
+parameters [
+  {
+    key: "SD_CHECKPOINT"
+    value: { string_value: "/opt/strands-decider/checkpoint" }
+  },
+  {
+    key: "SD_MERGED_TORSO"
+    value: { string_value: "/opt/strands-decider/merged" }
+  },
+  {
+    # hf | merged. `merged` folds the LoRA in: 1.59x-1.86x on the torso forward, measured.
+    key: "SD_ENGINE"
+    value: { string_value: "merged" }
+  },
+  {
+    # The HF shared-state cache. ON: it is why this engine exists rather than vLLM.
+    key: "SD_PREFIX_CACHE"
+    value: { string_value: "1" }
+  }
+]
