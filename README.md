@@ -89,6 +89,11 @@ A caller inside the same AWS region adds ~8–10 ms. Under load, latency becomes
 at 32 requests in flight a 7-question ticket sits at ~615 ms p50. Autoscaling exists to
 keep you off that.
 
+**Every number above is with CUDA graphs off, which is the default.** Turning them on
+(`SD_CUDA_GRAPHS=1`) takes a 1-question ticket from ~46 ms to **21 ms** and a 2-question one
+from ~48 ms to **30 ms**, and leaves the 7-question figure alone. See
+[Known limits](#known-limits) for why the split falls there.
+
 Long states are this deployment's strength: nearly doubling the input (601 → 1,025 tokens)
 costs ~14% of throughput, because the state is paid once per ticket rather than once per
 question.
@@ -108,6 +113,7 @@ and concurrency effects, and the error contract.
 ```
 src/strands_decider/      the model, prompt rendering, engines
   modeling.py             torso + pointer head + the masked softmax readout
+  cuda_graphs.py          CUDA graph capture of the forward passes (opt-in, see below)
   prompting.py            renders <state>/<question>/<options>/<answer>
   infer.py                SystemOneEngine: window fit, option spans, single-request paths
   batch_engine.py         cross-request batching; the one-pass/two-pass decision
@@ -125,7 +131,7 @@ deploy/
   create_endpoint.py      model, endpoint config, endpoint, autoscaling (boto3)
 serving/merge_lora.py     the build-time LoRA merge
 tools/                    verification and measurement, see below
-tests/                    80 unit tests, no GPU or AWS needed
+tests/                    110 unit tests, no GPU or AWS needed
 ```
 
 ### What this repo is *not*
@@ -160,7 +166,7 @@ deployable — the Triton image is CUDA and text-only.
 
 ```bash
 python -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
-.venv/bin/python -m pytest -q          # 80 passed
+.venv/bin/python -m pytest -q          # 110 passed
 ```
 
 Use the venv. The system interpreter usually lacks `fastapi`/`torch`, and the failure
@@ -253,7 +259,7 @@ requests batched alongside it.
 | --- | --- |
 | `tools/reference_check.py` | reproduces the model's published reference values. The strongest end-to-end check: it validates prompt rendering, the window fit, option spans, the pointer readout, the fitted temperatures, the confidence formulas, the folded LoRA and the wire format at once. Gate: zero decision mismatches. |
 | `tools/triton_smoke.sh` | starts the image the way SageMaker does (`docker run <image> serve`) and checks readiness, all three primitives, batching, caller errors, and that warm-up covered the shapes. |
-| `tools/batch_parity.py` | cross-request batching against the single-request path. Gate: **zero decision flips**; probability drift is advisory (≤7e-3 — batching changes bf16 reduction order). |
+| `tools/batch_parity.py` | cross-request batching against the single-request path. Gate: **zero decision flips**; probability drift is advisory (≤7e-3 — batching changes bf16 reduction order). `--cuda-graphs` / `--cuda-graphs-two-pass` put the batched side on the graph path and additionally **fail if nothing was captured or replayed**, so a silent fallback cannot pass the gate. |
 | `tools/bench_tickets.py` | tickets/s, decisions/s and per-decision latency by question count, ticket length and concurrency. Use `--tickets distinct` (the default). |
 | `tools/sm_sweep.py`, `tools/loadsweep_triton.py` | load sweeps through the endpoint and straight to the container. Both record GPU utilisation alongside throughput, so a saturated card is distinguishable from a starved load generator. |
 
@@ -281,14 +287,92 @@ loud:
 | `max_rows` | `BatchedSystemOneEngine` | 128 question rows per pass. Activation memory for the whole in-flight batch. |
 | `DUP_TOKEN_BUDGET` | `BatchedSystemOneEngine` | 480. Above this many duplicated state tokens, encoding the state once and forking the cache beats a single combined pass. |
 | `SD_ENGINE`, `SD_PREFIX_CACHE` | container env | `merged` folds the LoRA into the torso (no PEFT at runtime). Prefix caching on. |
+| `SD_CUDA_GRAPHS` | container env | `0`. `1` graphs the one-pass route (1 question 45.9 → 21.5 ms). `all` also graphs the state/row pair, which measured 0.73x–1.02x and is therefore not in `1`. Falls back to eager per shape. See [Known limits](#known-limits). |
 
 ## Known limits
 
-- **Throughput is dispatch-bound, not compute-bound.** One forward pass has a ~45 ms floor
-  on an L4 that is CPU kernel-launch overhead (~5,676 launches) against a 12.7 ms
-  weight-streaming floor, and prefill runs at ~34% of the card's peak. Cutting that floor
-  is the largest remaining serving win. Plain CUDA-graph capture was measured on this torso
-  and does not work — the shapes that go fast return wrong values.
+- **A small forward pass is dispatch-bound; a full one is not.** One pass has a ~45 ms
+  floor on an L4 that is CPU kernel-launch overhead (~5,676 launches) against a 12.7 ms
+  weight-streaming floor, and prefill runs at ~34% of the card's peak. That floor dominates
+  a *small* pass, which is why a one-question request costs almost as much as three. Once
+  the batcher fills a pass it stops being the limit.
+
+  **CUDA graph capture now exists and is opt-in: `SD_CUDA_GRAPHS=1`.** It is off by
+  default. This section used to say capture "does not work — the shapes that go fast return
+  wrong values", which was a true measurement of *plain* capture: transformers builds its
+  attention masks inside the forward, that code reads device data back to the host and
+  branches on it, and a host-side branch inside a capture has its *result* baked in, so the
+  graph replays one set of sequence lengths for ever. Hand the masks in precomputed —
+  transformers 5 takes `attention_mask` as a dict keyed by layer type — and replay is
+  bit-identical to an eager pass over the same buffers. See
+  [`src/strands_decider/cuda_graphs.py`](src/strands_decider/cuda_graphs.py), ported from
+  `kev` (credited in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)).
+
+  **What it buys, and the shape of it.** `evaluate_many` timed in-process, eager and
+  graphed alternated per iteration, median of 21, on an otherwise idle L4 (inter-quartile
+  spread ≤1.6 ms):
+
+  | request | state tokens | eager | `SD_CUDA_GRAPHS=1` | |
+  | --- | --- | --- | --- | --- |
+  | 1 question | 75 | 40.9 ms | **19.9 ms** | 2.06x |
+  | 1 question | 145 | 41.9 ms | **22.4 ms** | 1.87x |
+  | 1 question | 245 | 42.1 ms | 28.7 ms | 1.47x |
+  | 1 question | 335 | 43.7 ms | 35.9 ms | 1.22x |
+  | 1 question | 725 | 58.7 ms | 61.2 ms | 0.96x |
+  | 2 questions | 75 | 44.0 ms | 27.9 ms | 1.58x |
+  | 2 requests × 1 question | 75 | 43.0 ms | 28.3 ms | 1.52x |
+
+  Read down that table and the 45 ms floor is visible directly: **eager costs ~41 ms
+  whatever you put in it up to a few hundred tokens, and the graph costs what the tokens
+  actually cost** — 20 ms, 22 ms, 29 ms, 36 ms. The graph does not make the GPU faster; it
+  removes a fixed CPU cost and leaves a variable GPU one. So the win is 2x on the smallest
+  pass, shrinks as the pass fills, and is gone by ~400–500 tokens.
+
+  End to end through the container (`tools/bench_tickets.py --base`, concurrency 1, on an
+  otherwise-idle card). Run as eager → graphed → eager, so the two eager runs bracket the
+  graphed one; they agree within ~4%, which is the drift control, and the eager column below
+  is their range:
+
+  | | eager (bracketing runs) | `SD_CUDA_GRAPHS=1` |
+  | --- | --- | --- |
+  | 1 question | 19.8–20.5 decisions/s, p50 45.1–47.0 ms | **40.1 decisions/s, p50 21.0 ms** |
+  | 2 questions | 38.0–39.5 decisions/s, p50 47.2–49.1 ms | **59.6 decisions/s, p50 30.0 ms** |
+  | 3 questions | 56.2–57.8 decisions/s, p50 48.5–49.9 ms | 67.2 decisions/s, p50 40.6 ms |
+  | 7 questions | 63.9–66.7 decisions/s, p50 101.8–106.2 ms | 63.9 decisions/s, p50 103.3 ms |
+  | 7 questions + ~400-token document | 58.8–59.7 decisions/s, p50 114.1–116.1 ms | 58.8 decisions/s, p50 115.4 ms |
+
+  1,420 graph replays over 2,204 requests, 10 graphs captured, none failed. The 7-question
+  rows are unchanged **by design** — see below. Concurrency 8 and 32 are left out because
+  they did not settle at a 15-second window: the same cell measured twice inside one run
+  gave 37.8 and 78.4 decisions/s. That is queueing, and it is also the regime where graphs
+  are expected to do least, since a pass the batcher has filled is no longer paying for
+  launches.
+
+  **What is NOT fixed: the 7-question request, which is the headline number.** It takes the
+  engine's *two-pass* route (`DUP_TOKEN_BUDGET`), and graphing that pair measured
+  **slower** — 0.73x–1.02x. The cause is not capture. A graph cannot branch, so the state
+  pass must always carry an explicit `Sb × Sb` additive mask, which puts the 6 attention
+  layers on the masked SDPA path instead of the causal flash one that the eager path gets
+  for free whenever a batch's states are the same length; past a few hundred state tokens
+  that costs more than the launches it saves. That route is implemented, gated
+  (`SD_CUDA_GRAPHS=all`), correctness-tested, and **off**.
+
+  **What to try next, concretely.** Keep the state pass eager — it is compute-bound anyway
+  and it keeps the flash kernel — and graph only the row pass, whose mask is
+  `Lb × (Sr + Lb)` with `Lb` in the tens. The row pass is ~45 ms of the 92 ms a
+  one-request/7-question call takes, so this is worth about 1.3x on exactly the case the
+  table above misses. The reason it is not done here is memory: the row pass has to read
+  its states from fixed addresses, which is what the state bank exists for, and that bank
+  is the ~1.1 GB that made capture fail with CUDA OOM on a shared card. The way out is
+  visible but untried: do the per-row state gather **outside** the captured region, writing
+  straight into the row buffers. It is ~48 kernel launches against the 5,676 a pass costs,
+  so hoisting it out gives up nothing, and it deletes the bank entirely.
+
+  Two other limits, both deliberate: a pass is graphed all-or-nothing, so one state over
+  1,024 tokens in a batch sends that whole batch to the eager path; and the buffers are
+  fixed (64 MiB for the one-pass route, 1,188 MiB with the bank), so on a card shared with
+  anything else capture can fail with CUDA OOM — in which case it says so, stops trying,
+  and runs eagerly.
 - **`instance_group count: 2` is untested** and is the cheapest untried lever.
 - A single question costs almost as much as three, for the same reason: you are paying for
   the pass, not the work.

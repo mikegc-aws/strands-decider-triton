@@ -148,6 +148,7 @@ Who owns what, and the rule that keeps it honest:
 | --- | --- | --- |
 | `src/strands_decider/` | the model, prompt rendering, the window fit, both readout paths, temperatures, confidence formulas | **Unchanged from the base package.** Nothing in this repo reimplements inference. |
 | `src/strands_decider/batch_engine.py` | cross-request batching, the cache gather, the one/two-pass routing | The new serving capability |
+| `src/strands_decider/cuda_graphs.py` | CUDA graph capture of the forward passes: the state bank, shape bucketing, the padding masks | Opt-in, `SD_CUDA_GRAPHS`. Falls back to the eager pass per shape; see §9 |
 | `src/strands_decider/merged_engine.py` | loading a torso with the LoRA already folded in | No PEFT at runtime |
 | `src/decider_triton/wire.py` | JSON ↔ KServe v2 envelope | Deliberately free of Triton *and* torch imports, so it is unit-testable on a laptop |
 | `model_repository/decider/1/model.py` | Triton's batch → one engine call → responses in order | Adapter only. ~390 lines, no maths |
@@ -460,10 +461,21 @@ assemble a big batch and then split it anyway. That is measurable: raising
 
 Stated plainly so you do not discover it in production:
 
-- **Throughput is dispatch-bound, not compute-bound.** The ~45 ms floor is CPU kernel-launch
-  overhead, and prefill runs at ~34% of the card's peak. Cutting that floor is the largest
-  remaining win. Plain CUDA-graph capture was measured on this torso and **does not work** —
-  the shapes that go fast return wrong values.
+- **A small forward pass is dispatch-bound.** The ~45 ms floor is CPU kernel-launch
+  overhead, and prefill runs at ~34% of the card's peak — so a pass with one question in it
+  is paying for launches, not arithmetic. A pass the batcher has filled is not.
+
+  **CUDA graph capture closes that for the one-pass route, and is opt-in**
+  (`SD_CUDA_GRAPHS=1`, off by default): a one-question request goes 45.9 ms → 21.5 ms
+  server-side. This section used to say capture "does not work — the shapes that go fast
+  return wrong values". That was a true measurement of *plain* capture, and the reason is
+  worth knowing because it generalises: transformers builds its attention masks inside the
+  forward, that code reads device data back to the host and branches on it, and a capture
+  records kernels rather than branches — so the branch's *result* is baked in and the graph
+  replays one set of sequence lengths for ever. Hoist the masks out (transformers 5 accepts
+  `attention_mask` as a dict keyed by layer type) and replay is bit-identical to eager.
+  `src/strands_decider/cuda_graphs.py` carries the full account, and the two-pass route is
+  implemented but measured slower and left off; see README "Known limits".
 - **A single question costs almost as much as three.** Same reason: you are paying for the
   pass, not the work.
 - **Under load, latency becomes queueing.** At 32 requests in flight a 7-question ticket sits

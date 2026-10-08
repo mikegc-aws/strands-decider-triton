@@ -16,9 +16,15 @@ without changing anything above the forward pass.
 
 Measured, with a correctness check behind it rather than a throughput number alone:
 0 of 6 decision flips against the unmerged torso, max `|Δnoul|` 0.0078 and max
-`|Δscore|` 0.0033. (CUDA graph capture over this torso was measured on the same hardware
-and does **not** work -- it returns wrong values at every shape where it is fast, and no
-speedup at the shapes where it is correct. Do not reach for it here.)
+`|Δscore|` 0.0033.
+
+This docstring used to end "CUDA graph capture over this torso was measured on the same
+hardware and does **not** work -- it returns wrong values at every shape where it is fast.
+Do not reach for it here." That was a true measurement of *plain* capture and it is no
+longer the whole story: the wrong values came from transformers building its attention
+masks inside the captured region, where a host-side branch is baked in rather than
+recorded. Hand the masks in precomputed and replay is bit-identical to eager. See
+`cuda_graphs.py`, which is opt-in through `SD_CUDA_GRAPHS` and off by default.
 
 Unlike the vLLM engine this keeps the **shared-prefix path**, which is the torch engine's
 real advantage: it encodes the state once and forks its cache across the questions, where
@@ -171,6 +177,8 @@ def load_merged_engine(
     model_name: str = "strands-decider-merged",
     attn_implementation: str | None = None,
     max_rows: int = 128,
+    cuda_graphs: bool = False,
+    cuda_graphs_two_pass: bool = False,
 ) -> SystemOneEngine:
     """A `BatchedSystemOneEngine` over a pre-merged torso.
 
@@ -184,6 +192,15 @@ def load_merged_engine(
     per-pass floor across every request in flight instead of paying it per request. A
     server that does not know about `evaluate_many` simply never calls it, so this is a
     safe default rather than a behaviour change.
+
+    `cuda_graphs` is off by default and opt-in through `SD_CUDA_GRAPHS=1`. It replaces the
+    per-pass CPU dispatch with a graph replay on the ONE-pass route, which is where the
+    ~45 ms launch floor dominates: measured 45.9 ms -> 21.5 ms server-side for a
+    one-question request on an L4. `cuda_graphs_two_pass` (`SD_CUDA_GRAPHS=all`) extends it
+    to the state/row pair and is off even then, because it was measured at 0.73x-1.02x
+    there; `BatchedSystemOneEngine.__init__` records the numbers and the cause. Both fall
+    back to the eager path whenever capture is unavailable or a shape sits outside the
+    graphed envelope; see `cuda_graphs.py`.
     """
     model = build_merged_model(checkpoint, merged_torso,
                               attn_implementation=attn_implementation)
@@ -196,4 +213,6 @@ def load_merged_engine(
     )
     from .batch_engine import BatchedSystemOneEngine
 
-    return BatchedSystemOneEngine(model, cfg, max_rows=max_rows)
+    return BatchedSystemOneEngine(model, cfg, max_rows=max_rows,
+                                  cuda_graphs=cuda_graphs,
+                                  cuda_graphs_two_pass=cuda_graphs_two_pass)

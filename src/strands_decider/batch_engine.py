@@ -172,11 +172,240 @@ class BatchedSystemOneEngine(SystemOneEngine):
     DUP_TOKEN_BUDGET = 480
 
     def __init__(self, *args: Any, max_rows: int = 128,
-                 dup_token_budget: int | None = None, **kw: Any) -> None:
+                 dup_token_budget: int | None = None,
+                 cuda_graphs: bool = False, cuda_graphs_two_pass: bool = False,
+                 **kw: Any) -> None:
         super().__init__(*args, **kw)
         self.max_rows = max_rows
         self.dup_token_budget = (self.DUP_TOKEN_BUDGET if dup_token_budget is None
                                  else dup_token_budget)
+        # Opt-in, and off by default: the graph path is new, and the eager path is the one
+        # every published number was measured on. `SD_CUDA_GRAPHS=1` turns it on.
+        self.want_cuda_graphs = bool(cuda_graphs)
+        # The two-pass route is gated SEPARATELY and stays off even at
+        # `SD_CUDA_GRAPHS=1`, because it was measured and it does not pay on an L4.
+        #
+        # Interleaved A/B in one process -- the two routes alternated per iteration over
+        # one copy of the weights, because the measuring box was shared and a run that
+        # timed all of one route and then all of the other attributed a neighbour's load to
+        # whichever half it landed in. One request, seven questions, median of 9:
+        #
+        #   state tokens   145    335    505    725    945
+        #   eager/graph   0.86x  1.02x  0.84x  0.78x  0.73x
+        #
+        # The one-pass route over the same model goes the other way -- 2.06x at one
+        # question over a 75-token state -- so this is not capture being slow, it is the
+        # shape of the two-pass route. The state pass has to carry an explicit `Sb x Sb`
+        # mask (a graph cannot branch on "this batch needs no mask"), which puts attention
+        # on the masked SDPA path instead of the causal flash one, and that costs more than
+        # the kernel launches it saves as soon as a state passes a few hundred tokens. The
+        # eager path gets the fast kernel for free whenever a batch's states happen to be
+        # the same length.
+        #
+        # It is kept, correct and parity-gated rather than deleted, because it is the part
+        # worth building on: see README "Known limits" for the variant to try next (eager
+        # state pass, graphed row pass). `SD_CUDA_GRAPHS=all` turns it on.
+        self.want_cuda_graphs_two_pass = bool(cuda_graphs_two_pass)
+        self._graphs: Any = None
+        self._graphs_tried = False
+
+    # ---- CUDA graphs -----------------------------------------------------
+
+    def graphs(self) -> Any:
+        """The `CudaGraphs` helper, or None if graphs are off or unavailable here.
+
+        Built on first use rather than in `__init__` so a server that never calls
+        `evaluate_many` (the FastAPI path) allocates no buffers at all, and so the layout
+        probe runs after the model is on its device. The footprint is 64 MiB for the
+        one-pass route and 1,188 MiB with the state bank, measured on this model.
+        """
+        if self._graphs is not None or self._graphs_tried:
+            return self._graphs
+        self._graphs_tried = True
+        if not (self.want_cuda_graphs or self.want_cuda_graphs_two_pass):
+            return None
+        try:
+            from .cuda_graphs import CudaGraphs
+
+            pad_id = self.tok.pad_token_id if self.tok.pad_token_id is not None else 0
+            self._graphs = CudaGraphs(self.model.torso, pad_id,
+                                      two_pass=self.want_cuda_graphs_two_pass)
+            print(f"[strands-decider] cuda graphs enabled "
+                  f"({self._graphs.bytes() / 2**20:.0f} MiB of buffers, "
+                  f"two_pass={self.want_cuda_graphs_two_pass})")
+        except Exception as exc:
+            # Same instinct as `UnforkableCache` degrading to batched encoding: the eager
+            # path answers identically, just slower, so an unavailable graph path must not
+            # be a failed request.
+            print(f"[strands-decider] cuda graphs unavailable ({type(exc).__name__}: "
+                  f"{exc}); using the eager forward path")
+            self._graphs = None
+        return self._graphs
+
+    def _disable_graphs(self, exc: BaseException) -> None:
+        """Give up on graphs for the rest of this process, and say why.
+
+        Deliberately permanent rather than per call. A pass that raised part-way through
+        may have left the shared buffers half written, and while nothing reads them before
+        the next pass refills them, a path that keeps failing and retrying would turn one
+        bug into a latency cliff on every request.
+        """
+        import traceback
+
+        print(f"[strands-decider] cuda graph pass failed, falling back to the eager "
+              f"forward path for the rest of this process: {type(exc).__name__}: {exc}\n"
+              f"{traceback.format_exc()}", flush=True)
+        self._graphs = None
+        self.want_cuda_graphs = False
+        self.want_cuda_graphs_two_pass = False
+
+    def capture_pending(self, limit: int | None = None) -> int:
+        """Capture graphs for the shapes seen so far. Returns how many were captured.
+
+        Exposed so warm-up can pay the ~0.4 s per capture before the server reports ready
+        (`model.py::_warmup`), rather than leaving it to whichever caller arrives first.
+        """
+        graphs = self.graphs()
+        if graphs is None:
+            return 0
+        with graphs.lock:
+            return int(graphs.capture_pending(limit))
+
+    def graph_stats(self) -> dict[str, int]:
+        graphs = self.graphs()
+        return graphs.stats() if graphs is not None else {}
+
+    def _row_mask(self, lens: list[int], width: int) -> torch.Tensor:
+        """`[rows, width]` 1/0 mask from real lengths, matching `_pad`'s right-padding.
+
+        The graph path already knows every length exactly, but the readout finds the
+        `<answer>` position through `pool_last_token(hidden, mask)` -- so it is handed the
+        same mask the eager path would have built, and there is one pooling rule rather
+        than two.
+        """
+        ar = torch.arange(width, device=self.device)
+        return (ar[None, :] < torch.tensor(lens, device=self.device)[:, None]).long()
+
+    def _readout(
+        self,
+        hidden: torch.Tensor,
+        mask: torch.Tensor,
+        row_rendered: list[RenderedQuestion],
+        opt_idx: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Hidden states -> per-row probabilities. Extracted from `_rows_probs`, unchanged.
+
+        It exists as a method because the CUDA-graph path produces `hidden` itself and so
+        cannot go through `model.forward`, which would re-run the torso. Keeping it in one
+        place is what stops the graph path and the eager two-pass path drifting apart --
+        and `tools/batch_parity.py` gates that they have not.
+        """
+        pooled = pool_last_token(hidden, mask).to(torch.float32)
+        n_slots = torch.tensor([rq.n_slots for rq in row_rendered], device=self.device)
+        if self.model.config.head_type == "pointer":
+            if opt_idx is None:
+                raise ValueError("pointer head needs opt_idx (option token positions)")
+            options = gather_options(hidden, opt_idx)
+            raw = self.model.head(pooled, options.to(torch.float32))
+        else:
+            raw = self.model.head(pooled)
+        logits = apply_temperature(
+            raw, self._temperatures([rq.kind for rq in row_rendered]))
+        return masked_log_softmax(logits, n_slots).exp()
+
+    def _absolute_opt_idx(
+        self,
+        bases: list[int],
+        row_rendered: list[RenderedQuestion],
+        row_offsets: list[list[tuple[int, int]]],
+    ) -> torch.Tensor | None:
+        """Option token positions for the one-pass route: absolute, one base per row.
+
+        `_option_idx` takes a single shared base, which is right for the two-pass route
+        where every row's hidden states start at its suffix. Here each row carries its own
+        state, so its options sit after **its** state length.
+        """
+        if self.model.config.head_type != "pointer":
+            return None
+        rows = [
+            [base + i for i in _option_token_index(offs, rq.option_spans, 0)]
+            for base, rq, offs in zip(bases, row_rendered, row_offsets, strict=True)
+        ]
+        width = max(len(r) for r in rows)
+        return torch.tensor([r + [-1] * (width - len(r)) for r in rows],
+                            dtype=torch.long, device=self.device)
+
+    def _graph_combined(
+        self,
+        prompts: list[list[int]],
+        row_rendered: list[RenderedQuestion],
+        opt_idx: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, int] | None:
+        """The one-pass route through a captured graph, or None to run it eagerly."""
+        graphs = self.graphs() if self.want_cuda_graphs else None
+        if graphs is None:
+            return None
+        from .cuda_graphs import GraphsUnavailable, admits_combined
+
+        lens = [len(p) for p in prompts]
+        if not admits_combined(lens):
+            return None
+        try:
+            with graphs.lock:
+                hidden = graphs.combined(prompts)
+                if graphs.capture_due():
+                    graphs.capture_pending(limit=1)
+            mask = self._row_mask(lens, hidden.size(1))
+            return self._readout(hidden, mask, row_rendered, opt_idx), sum(lens)
+        except GraphsUnavailable:
+            # A shape that does not fit a buffer, not a broken graph path: decline this
+            # call and let the eager route answer it. Keeping graphs on for the next
+            # request is the point -- one awkward shape must not cost every later one.
+            return None
+        except Exception as exc:
+            self._disable_graphs(exc)
+            return None
+
+    def _graph_two_pass(
+        self,
+        states: list[list[int]],
+        row_state: list[int],
+        row_q: list[list[int]],
+        row_rendered: list[RenderedQuestion],
+        row_offsets: list[list[tuple[int, int]]],
+    ) -> tuple[torch.Tensor, int] | None:
+        """The two-pass route through captured graphs, or None to run it eagerly.
+
+        The state pass leaves state `i` in bank entry `i`, which is exactly what
+        `row_state` already indexes -- so the cache gather `_gather_layered_cache` does by
+        hand becomes an `index_select` inside the row graph.
+        """
+        graphs = self.graphs() if self.want_cuda_graphs_two_pass else None
+        if graphs is None:
+            return None
+        from .cuda_graphs import GraphsUnavailable, admits_two_pass
+
+        state_lens = [len(s) for s in states]
+        row_lens = [len(q) for q in row_q]
+        if not admits_two_pass(state_lens, row_lens):
+            return None
+        try:
+            with graphs.lock:
+                graphs.states(states)
+                hidden = graphs.rows(row_q, row_state, state_lens)
+                if graphs.capture_due():
+                    graphs.capture_pending(limit=1)
+            mask = self._row_mask(row_lens, hidden.size(1))
+            probs = self._readout(
+                hidden, mask, row_rendered,
+                self._option_idx(row_rendered, 0, row_offsets)
+                if self.model.config.head_type == "pointer" else None)
+            return probs, sum(state_lens) + sum(row_lens)
+        except GraphsUnavailable:
+            return None   # see `_graph_combined`: decline the shape, keep the path
+        except Exception as exc:
+            self._disable_graphs(exc)
+            return None
 
     # ---- preparation -----------------------------------------------------
 
@@ -231,6 +460,12 @@ class BatchedSystemOneEngine(SystemOneEngine):
             return self._rows_probs_one_pass(
                 states, row_state, row_q, row_rendered, row_offsets)
 
+        # ---- the graphed route, if it is available and these shapes fit it. Two passes
+        # still, the same two, with the per-pass CPU dispatch replaced by one replay.
+        graphed = self._graph_two_pass(states, row_state, row_q, row_rendered, row_offsets)
+        if graphed is not None:
+            return graphed
+
         # ---- pass 1: all distinct states, LEFT-padded (see module docstring)
         width = max(len(s) for s in states)
         state_ids = torch.tensor(
@@ -259,17 +494,10 @@ class BatchedSystemOneEngine(SystemOneEngine):
 
         # ---- readout. `hidden` is the suffix only, so option positions are
         # suffix-relative and take base=0: the cached state never enters the gather.
-        pooled = pool_last_token(hidden, full_mask).to(torch.float32)
-        n_slots = torch.tensor([rq.n_slots for rq in row_rendered], device=self.device)
-        if self.model.config.head_type == "pointer":
-            options = gather_options(
-                hidden, self._option_idx(row_rendered, 0, row_offsets))
-            raw = self.model.head(pooled, options.to(torch.float32))
-        else:
-            raw = self.model.head(pooled)
-        logits = apply_temperature(
-            raw, self._temperatures([rq.kind for rq in row_rendered]))
-        probs = masked_log_softmax(logits, n_slots).exp()
+        probs = self._readout(
+            hidden, full_mask, row_rendered,
+            self._option_idx(row_rendered, 0, row_offsets)
+            if self.model.config.head_type == "pointer" else None)
 
         n_tokens = int(state_mask.sum().item()) + int(suffix_mask.sum().item())
         return probs, n_tokens
@@ -291,20 +519,16 @@ class BatchedSystemOneEngine(SystemOneEngine):
         are absolute here, so each row's base is **its own** state length rather than one
         shared prefix length.
         """
-        ids, mask = self._pad([states[si] + q for si, q in zip(row_state, row_q,
-                                                               strict=True)])
+        prompts = [states[si] + q for si, q in zip(row_state, row_q, strict=True)]
         bases = [len(states[si]) for si in row_state]
+        opt_idx = self._absolute_opt_idx(bases, row_rendered, row_offsets)
+
+        graphed = self._graph_combined(prompts, row_rendered, opt_idx)
+        if graphed is not None:
+            return graphed
+
+        ids, mask = self._pad(prompts)
         n_slots = torch.tensor([rq.n_slots for rq in row_rendered], device=self.device)
-        opt_idx = None
-        if self.model.config.head_type == "pointer":
-            rows = [
-                [base + i for i in _option_token_index(offs, rq.option_spans, 0)]
-                for base, rq, offs in zip(bases, row_rendered, row_offsets, strict=True)
-            ]
-            width = max(len(r) for r in rows)
-            opt_idx = torch.tensor(
-                [r + [-1] * (width - len(r)) for r in rows],
-                dtype=torch.long, device=self.device)
         out = self.model(
             input_ids=ids,
             attention_mask=mask,
