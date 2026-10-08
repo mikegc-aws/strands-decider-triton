@@ -15,8 +15,21 @@ future cross-request batched forward pass slots into. It is NOT yet a shared for
 That gap is the measured ceiling on the torch path: 12 req/s at one worker, and *worse* with
 more (5.2 at 4, 3.8 at 8), because concurrent passes contend without any going faster.
 
-`execute()` receives whatever Triton's dynamic batcher coalesced and turns it into **one
-engine call per distinct state**, which is where the saving is -- see `_group_by_state`.
+**Two paths through `execute()`, and which one you are actually on.**
+
+1. The *batched* path, and the one production uses. If the engine offers `evaluate_many`
+   -- `BatchedSystemOneEngine` does, so `SD_ENGINE=merged` does -- the whole Triton batch
+   becomes ONE call, and the engine spends two forward passes on it rather than two per
+   request. This is where the saving is.
+2. The *per-request* path, `_group_by_state` and friends below. It is NOT dead code and
+   NOT merely historical: `SD_ENGINE=hf` builds a plain `SystemOneEngine`, which has no
+   `evaluate_many`, so that arm runs here. It is also the fallback if the batched path
+   itself raises -- the single-request route shares `_fit`, the readout and the head, so it
+   is the same answers by a slower route, which beats failing every caller at once.
+
+Both are covered by `tests/test_triton_backend.py`, which parametrises over an engine with
+`evaluate_many` and one without, because "the tests pass" meant the per-request path only
+until that was fixed.
 
 Only the merged HF engine belongs behind this. vLLM batches internally across its own
 scheduler, so a second batching queue in front of it would add latency and coalesce
@@ -207,11 +220,11 @@ class TritonPythonModel:
             )
 
     def _group_by_state(self, parsed: list) -> dict:
-        """Group a Triton batch by state text, preserving each request's slot.
+        """Group a Triton batch by rendered state, preserving each request's slot.
 
-        This is where the batching actually pays. The expensive part of this model is
-        encoding the *state*: the shared-prefix path encodes it once and forks its KV cache
-        across the questions, so `state + N x question` tokens instead of
+        This is where the per-request path's batching pays. The expensive part of this model
+        is encoding the *state*: the shared-prefix path encodes it once and forks its KV
+        cache across the questions, so `state + N x question` tokens instead of
         `N x (state + question)`. Two requests that share a state can therefore be answered
         in one engine call for roughly the price of one, and agent traffic does share states
         -- a guardrail panel asks several questions about the same payload.
@@ -220,14 +233,23 @@ class TritonPythonModel:
         make them one forward pass, and this backend does not pretend otherwise: merging
         unrelated states into one padded batch would re-encode each of them anyway, which is
         the same reason `scheduler.py` never did it.
+
+        The key is the RENDERED state, not the raw value, and that is a correctness fix
+        rather than tidiness. Keying on `json.dumps(state)` collided a string state with a
+        structurally equal dict one -- the string `'{"a": 1}'` against the object
+        `{"a": 1}` -- which render DIFFERENTLY: `render_content` uses a string as-is and
+        re-emits a dict with `indent=2`. `_merge_same_state` then keeps only the first
+        member's state, so the other caller would receive answers computed against a prompt
+        it never sent, at HTTP 200. Grouping on the rendered text makes "same group" mean
+        "same prompt prefix", which is exactly what the merge requires.
         """
+        from strands_decider.prompting import render_state
+
         groups: dict[str, list[int]] = {}
         for i, req in enumerate(parsed):
             if req is None:
                 continue
-            key = json.dumps(req.state, sort_keys=True) if not isinstance(
-                req.state, str) else req.state
-            groups.setdefault(key, []).append(i)
+            groups.setdefault(render_state(req.state), []).append(i)
         return groups
 
     def execute(self, requests: list) -> list:

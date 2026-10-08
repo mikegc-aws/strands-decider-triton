@@ -7,6 +7,19 @@ is split into engine calls, and how the answers are routed back.
 The failure this file mostly exists to prevent is **cross-request answer contamination** --
 caller A receiving caller B's probability distribution, at HTTP 200, with a well-formed
 body. There is no way to notice that from outside.
+
+BOTH of `execute`'s paths are covered, and that is the point of the parametrised `model`
+fixture. `execute` prefers the engine's `evaluate_many` when it has one and falls back to a
+per-request loop otherwise:
+
+    _BatchedStubEngine  has evaluate_many  -> the batched path. What SD_ENGINE=merged runs,
+                                             i.e. production.
+    _StubEngine         has not            -> the per-request path. What SD_ENGINE=hf runs,
+                                             and the fallback when the batched path raises.
+
+This file previously defined only the second one, so every test exercised the path
+production does *not* take, and the contamination properties above were unverified on the
+path that actually serves traffic.
 """
 
 from __future__ import annotations
@@ -95,14 +108,18 @@ def _load_model_module():
     return mod
 
 
-# ----------------------------------------------------------------------- the engine stub
+# ----------------------------------------------------------------------- engine stubs
 
 
 class _StubEngine:
-    """Records the requests it was handed and answers every question deterministically."""
+    """Per-request engine, with no `evaluate_many`. What `SD_ENGINE=hf` builds.
+
+    Records the requests it was handed and answers every question deterministically.
+    """
 
     def __init__(self):
         self.calls: list = []
+        self.many_calls: list = []
 
     def evaluate(self, request):
         from strands_decider.schema import NoulAnswer, SystemOneResponse, Usage
@@ -116,16 +133,51 @@ class _StubEngine:
                                  usage=Usage(input_tokens=300, output_tokens=len(answers)))
 
 
-@pytest.fixture
-def model():
+class _BatchedStubEngine(_StubEngine):
+    """Engine offering `evaluate_many`, like `BatchedSystemOneEngine`. Production's path.
+
+    Mirrors the real contract: one call for the whole batch, and a per-request error is
+    RETURNED in place rather than raised, so one bad request cannot fail its neighbours.
+    """
+
+    def evaluate_many(self, requests):
+        self.many_calls.append(list(requests))
+        out: list = []
+        for r in requests:
+            try:
+                out.append(self.evaluate(r))
+            except Exception as exc:
+                out.append(exc)
+        return out
+
+
+def _build(engine):
     mod = _load_model_module()
     m = mod.TritonPythonModel()
     m.logger = sys.modules["triton_python_backend_utils"].Logger
-    m.engine = _StubEngine()
+    m.engine = engine
     return m
 
 
-def _req(state: str, questions: dict) -> dict:
+@pytest.fixture(params=["batched", "per_request"])
+def model(request):
+    """Both paths through `execute`. See the module docstring."""
+    return _build(_BatchedStubEngine() if request.param == "batched" else _StubEngine())
+
+
+@pytest.fixture
+def per_request_model():
+    """Only the per-request path, for assertions about `_group_by_state` itself."""
+    return _build(_StubEngine())
+
+
+@pytest.fixture
+def batched_model():
+    """Only the batched path, for assertions about `evaluate_many` dispatch."""
+    return _build(_BatchedStubEngine())
+
+
+def _req(state, questions: dict) -> dict:
     body = json.dumps({"state": state, "questions": questions}).encode()
     return {"REQUEST_JSON": _Tensor("REQUEST_JSON", body)}
 
@@ -134,28 +186,10 @@ def _noul(instr="urgent?"):
     return {"type": "noul", "instructions": instr}
 
 
-# -------------------------------------------------------------------------- grouping
-
-
-def test_same_state_requests_become_one_engine_call(model):
-    """The point of batching here: the state is encoded once for the whole group."""
-    reqs = [_req("same payload", {"a": _noul()}),
-            _req("same payload", {"b": _noul()}),
-            _req("same payload", {"c": _noul()})]
-    responses = model.execute(reqs)
-
-    assert len(model.engine.calls) == 1, "same-state requests should share one forward"
-    assert len(responses) == 3
-    assert set(responses[0].body()["answers"]) == {"a"}
-    assert set(responses[1].body()["answers"]) == {"b"}
-    assert set(responses[2].body()["answers"]) == {"c"}
-
-
-def test_distinct_states_get_their_own_calls(model):
-    """Merging unrelated states would re-encode each one anyway, so it is not done."""
-    reqs = [_req("one", {"a": _noul()}), _req("two", {"b": _noul()})]
-    model.execute(reqs)
-    assert len(model.engine.calls) == 2
+# ------------------------------------------------------- routing, on BOTH paths
+#
+# These are the properties a caller can actually observe, so they must hold whichever
+# path `execute` took.
 
 
 def test_answers_are_never_routed_to_the_wrong_caller(model):
@@ -173,7 +207,6 @@ def test_duplicate_question_names_across_callers_do_not_collide(model):
     reqs = [_req("s", {"urgent": _noul("A")}), _req("s", {"urgent": _noul("B")})]
     responses = model.execute(reqs)
 
-    assert len(model.engine.calls) == 1
     assert set(responses[0].body()["answers"]) == {"urgent"}
     assert set(responses[1].body()["answers"]) == {"urgent"}
 
@@ -193,19 +226,6 @@ def test_question_names_resembling_internal_keys_are_handled(model):
 
     assert set(responses[0].body()["answers"]) == {"__1__x", "mine"}
     assert set(responses[1].body()["answers"]) == {"x"}
-
-
-def test_structured_state_groups_by_value(model):
-    """A dict state is rendered deterministically, so equal dicts share a forward."""
-    a = {"REQUEST_JSON": _Tensor("REQUEST_JSON", json.dumps(
-        {"state": {"x": 1, "y": 2}, "questions": {"a": _noul()}}).encode())}
-    b = {"REQUEST_JSON": _Tensor("REQUEST_JSON", json.dumps(
-        {"state": {"x": 1, "y": 2}, "questions": {"b": _noul()}}).encode())}
-    model.execute([a, b])
-    assert len(model.engine.calls) == 1
-
-
-# ------------------------------------------------------------------- one response each
 
 
 def test_every_request_gets_exactly_one_response_in_order(model):
@@ -254,17 +274,133 @@ def test_an_unexpected_engine_failure_is_tagged_internal(model):
     assert body["error"]["type"] == "internal"
 
 
-# ------------------------------------------------------------------------------ usage
-
-
-def test_shared_state_tokens_are_not_charged_to_every_caller(model):
-    """The state was encoded once; billing each member for all of it would overcount."""
-    reqs = [_req("s", {"a": _noul()}), _req("s", {"b": _noul()})]
-    responses = model.execute(reqs)
-    total = sum(r.body()["usage"]["input_tokens"] for r in responses)
-    assert total <= 300, f"group encoded 300 tokens but reported {total}"
-
-
 def test_response_shape_matches_the_http_server(model):
     body = model.execute([_req("s", {"q": _noul()})])[0].body()
     assert set(body) == {"model", "answers", "usage", "latency_ms"}
+
+
+def test_an_empty_batch_is_a_no_op(model):
+    assert model.execute([]) == []
+
+
+# ------------------------------------------------- the batched path specifically
+
+
+def test_the_whole_batch_becomes_one_engine_call(batched_model):
+    """The reason Triton is here. 8 requests must not cost 8 engine calls."""
+    reqs = [_req(f"state {i}", {"q": _noul()}) for i in range(8)]
+    batched_model.execute(reqs)
+
+    assert len(batched_model.engine.many_calls) == 1, "one evaluate_many for the batch"
+    assert len(batched_model.engine.many_calls[0]) == 8
+
+
+def test_the_per_request_path_is_not_used_when_evaluate_many_exists(batched_model):
+    """Belt and braces: distinct states must not quietly fall through to the old loop."""
+    reqs = [_req("one", {"a": _noul()}), _req("two", {"b": _noul()})]
+    responses = batched_model.execute(reqs)
+
+    assert len(batched_model.engine.many_calls) == 1
+    assert batched_model.engine.calls == [] or len(batched_model.engine.calls) == 2, (
+        "the stub's evaluate_many delegates per request; what matters is that execute "
+        "itself did not run the per-request loop")
+    assert set(responses[0].body()["answers"]) == {"a"}
+    assert set(responses[1].body()["answers"]) == {"b"}
+
+
+def test_a_batched_failure_falls_back_to_the_per_request_path(batched_model):
+    """A failure OF the batched path, not of one request, must not fail every caller.
+
+    The single-request route shares `_fit`, the readout and the head, so it is the same
+    answers by a slower route -- which beats returning an error to everyone.
+    """
+    def explode(_requests):
+        raise RuntimeError("batched forward blew up")
+
+    batched_model.engine.evaluate_many = explode
+    reqs = [_req("a", {"q": _noul()}), _req("b", {"q": _noul()})]
+    responses = batched_model.execute(reqs)
+
+    assert len(batched_model.engine.calls) == 2, "fell back to per-request evaluate"
+    assert all("answers" in r.body() for r in responses)
+
+
+def test_a_per_request_error_from_evaluate_many_is_attributed_to_that_request(batched_model):
+    """`evaluate_many` RETURNS errors per request. A ValueError in slot 1 must land on
+    slot 1 and nowhere else."""
+    real = batched_model.engine.evaluate_many
+
+    def selective(requests):
+        out = real(requests)
+        out[1] = ValueError("question has 300 options but this model has 24 slots")
+        return out
+
+    batched_model.engine.evaluate_many = selective
+    responses = batched_model.execute([_req("a", {"q": _noul()}),
+                                       _req("b", {"q": _noul()}),
+                                       _req("c", {"q": _noul()})])
+
+    assert "answers" in responses[0].body()
+    assert responses[1].body()["error"]["type"] == "invalid_request"
+    assert "answers" in responses[2].body()
+
+
+# ------------------------------------------- the per-request path specifically
+
+
+def test_same_state_requests_become_one_engine_call(per_request_model):
+    """The point of grouping here: the state is encoded once for the whole group."""
+    reqs = [_req("same payload", {"a": _noul()}),
+            _req("same payload", {"b": _noul()}),
+            _req("same payload", {"c": _noul()})]
+    responses = per_request_model.execute(reqs)
+
+    assert len(per_request_model.engine.calls) == 1, "same-state requests share one forward"
+    assert len(responses) == 3
+    assert set(responses[0].body()["answers"]) == {"a"}
+    assert set(responses[1].body()["answers"]) == {"b"}
+    assert set(responses[2].body()["answers"]) == {"c"}
+
+
+def test_distinct_states_get_their_own_calls(per_request_model):
+    """Merging unrelated states would re-encode each one anyway, so it is not done."""
+    reqs = [_req("one", {"a": _noul()}), _req("two", {"b": _noul()})]
+    per_request_model.execute(reqs)
+    assert len(per_request_model.engine.calls) == 2
+
+
+def test_structured_state_groups_by_value(per_request_model):
+    """A dict state is rendered deterministically, so equal dicts share a forward."""
+    reqs = [_req({"x": 1, "y": 2}, {"a": _noul()}),
+            _req({"x": 1, "y": 2}, {"b": _noul()})]
+    per_request_model.execute(reqs)
+    assert len(per_request_model.engine.calls) == 1
+
+
+def test_a_string_state_is_not_grouped_with_an_equal_looking_dict(per_request_model):
+    """Regression. `json.dumps({"a": 1})` is exactly the string `'{"a": 1}'`, so keying
+    the groups on `json.dumps` merged these two -- but they RENDER differently
+    (`render_content` uses a string as-is and re-emits a dict with `indent=2`). Since
+    `_merge_same_state` keeps only the first member's state, the second caller would have
+    received answers computed against a prompt it never sent, at HTTP 200. The key is the
+    rendered state now, so the two stay apart.
+    """
+    as_dict = _req({"a": 1}, {"q": _noul()})
+    as_text = _req(json.dumps({"a": 1}), {"q": _noul()})
+    assert json.dumps({"a": 1}) == '{"a": 1}'  # the collision this guards
+
+    responses = per_request_model.execute([as_dict, as_text])
+
+    assert len(per_request_model.engine.calls) == 2, (
+        "a string state and a dict state render differently and must not be merged")
+    states = [c.state for c in per_request_model.engine.calls]
+    assert {"a": 1} in states and '{"a": 1}' in states
+    assert all("answers" in r.body() for r in responses)
+
+
+def test_shared_state_tokens_are_not_charged_to_every_caller(per_request_model):
+    """The state was encoded once; billing each member for all of it would overcount."""
+    reqs = [_req("s", {"a": _noul()}), _req("s", {"b": _noul()})]
+    responses = per_request_model.execute(reqs)
+    total = sum(r.body()["usage"]["input_tokens"] for r in responses)
+    assert total <= 300, f"group encoded 300 tokens but reported {total}"
