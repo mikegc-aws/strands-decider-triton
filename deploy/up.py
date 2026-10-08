@@ -300,6 +300,17 @@ def main() -> int:
     ap.add_argument("--role", default="",
                     help="an existing execution role ARN; one is created if omitted")
     ap.add_argument("--role-name", default=DEFAULT_ROLE_NAME)
+    # Passed straight through to create_endpoint.py, which owns what they mean. They are
+    # here because `up.py` is the path that also VERIFIES the endpoint with a real
+    # invocation, and a tuning-knob deploy is exactly the kind that needs verifying: an
+    # env var the backend refuses (SD_FUSE_LAYERS=1 on SD_ENGINE=hf) fails inside
+    # initialize(), and without step 5 that looks like a healthy endpoint.
+    ap.add_argument("--env", action="append", default=[], metavar="KEY=VALUE",
+                    help="extra container environment, repeatable "
+                         "(e.g. --env SD_FUSE_LAYERS=1)")
+    ap.add_argument("--model-data-url", default="",
+                    help="s3:// archive extracted over the Triton model repository at "
+                         "/opt/ml/model; the no-rebuild route to instance_group count")
     ap.add_argument("--target-invocations", type=float, default=0.0,
                     help="invocations/instance/MINUTE for autoscaling; 0 disables it. See "
                          "create_endpoint.py for how to pick this from the measured ceiling")
@@ -361,6 +372,10 @@ def main() -> int:
                     "--region", args.region, "--instance-type", args.instance_type]
     if args.target_invocations > 0:
         endpoint_cmd += ["--target-invocations", str(args.target_invocations)]
+    for item in args.env:
+        endpoint_cmd += ["--env", item]
+    if args.model_data_url:
+        endpoint_cmd += ["--model-data-url", args.model_data_url]
     run(endpoint_cmd)
 
     verify(args.region, args.name)

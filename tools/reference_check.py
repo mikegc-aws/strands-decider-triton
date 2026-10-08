@@ -29,6 +29,15 @@ calibration test.
 
 Usage:
     reference_check.py --base http://localhost:8100 --path /invocations --triton
+    reference_check.py --endpoint sd-l40s-2xl --region us-west-2
+
+`--endpoint` exists because this gate has to be runnable against a *card*, and some of them
+only come as a SageMaker endpoint. The L40S instance types (`ml.g6e.*`) are hosted, not
+shelled into: there is no container port to point `--base` at, so before this flag the
+project's governing rule -- zero decision mismatches before any throughput number is
+trusted -- could not be applied to a new instance type at all. The decision gate is the
+thing that matters here rather than the transport: bf16 reduction order depends on the
+kernels the card selects, so "it was right on an L4" is not evidence about an L40S.
 """
 
 from __future__ import annotations
@@ -75,10 +84,29 @@ CASES: list[dict] = [
 ]
 
 
+def envelope(payload: dict) -> dict:
+    """Wrap a System One request in the KServe v2 envelope.
+
+    `shape: [1, 1]` because the model sets `max_batch_size > 0` and Triton prepends the
+    batch dimension. A hand-rolled `[1]` is the most common way to get an opaque
+    "Unable to parse 'inputs'" out of this endpoint.
+    """
+    return {"inputs": [{"name": "REQUEST_JSON", "shape": [1, 1],
+                        "datatype": "BYTES", "data": [json.dumps(payload)]}]}
+
+
+def unwrap(out: dict) -> dict:
+    if "error" in out and "outputs" not in out:
+        raise ValueError(f"Triton error: {out['error']}")
+    for o in out.get("outputs") or []:
+        if o.get("name") == "RESPONSE_JSON":
+            return json.loads(o["data"][0])
+    raise ValueError(f"no RESPONSE_JSON in {sorted(out)}")
+
+
 def post(url: str, payload: dict, triton: bool, timeout: float = 300.0) -> dict:
     if triton:
-        payload = {"inputs": [{"name": "REQUEST_JSON", "shape": [1, 1],
-                               "datatype": "BYTES", "data": [json.dumps(payload)]}]}
+        payload = envelope(payload)
     req = urllib.request.Request(url, data=json.dumps(payload).encode(),
                                  headers={"Content-Type": "application/json"},
                                  method="POST")
@@ -86,12 +114,30 @@ def post(url: str, payload: dict, triton: bool, timeout: float = 300.0) -> dict:
         out = json.loads(resp.read().decode())
     if not triton:
         return out
-    if "error" in out and "outputs" not in out:
-        raise ValueError(f"Triton error: {out['error']}")
-    for o in out.get("outputs") or []:
-        if o.get("name") == "RESPONSE_JSON":
-            return json.loads(o["data"][0])
-    raise ValueError(f"no RESPONSE_JSON in {sorted(out)}")
+    return unwrap(out)
+
+
+def post_endpoint(endpoint: str, region: str, payload: dict,
+                  timeout: float = 300.0) -> dict:
+    """The same request through `InvokeEndpoint`, for a card with no reachable HTTP port.
+
+    boto3 is imported here rather than at module scope on purpose: the HTTP path needs
+    nothing but the standard library, and a laptop checking a local container should not be
+    made to install boto3 to do it.
+
+    Retries are off. A retried request would turn a server error into latency, and this is
+    a correctness gate -- a request that had to be retried to succeed is a result worth
+    seeing, not one worth hiding.
+    """
+    import boto3
+    from botocore.config import Config
+
+    rt = boto3.client("sagemaker-runtime", region_name=region,
+                      config=Config(read_timeout=timeout, connect_timeout=30,
+                                    retries={"max_attempts": 0}))
+    raw = rt.invoke_endpoint(EndpointName=endpoint, ContentType="application/json",
+                             Body=json.dumps(envelope(payload)))["Body"].read().decode()
+    return unwrap(json.loads(raw))
 
 
 def check(answer: dict, expect: dict, warn: float) -> tuple[bool, list[str]]:
@@ -139,20 +185,35 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--base", default="http://localhost:8100")
     ap.add_argument("--path", default="/invocations")
+    ap.add_argument("--endpoint", default="",
+                    help="SageMaker endpoint name. Goes through InvokeEndpoint instead of "
+                         "HTTP, which is the only way to reach a hosted card (ml.g6e.*), "
+                         "and always uses the KServe v2 envelope")
+    ap.add_argument("--region", default="us-west-2")
     ap.add_argument("--triton", action="store_true",
-                    help="wrap in the KServe v2 envelope (the Triton deployable)")
+                    help="wrap in the KServe v2 envelope (the Triton deployable). Implied "
+                         "by --endpoint")
     ap.add_argument("--warn", type=float, default=0.02)
     args = ap.parse_args()
 
     url = args.base.rstrip("/") + args.path
-    print(f"[ref] {url}  (published v21 reference values)")
+    target = f"sagemaker://{args.endpoint}" if args.endpoint else url
+    print(f"[ref] {target}  (published v21 reference values)")
     failures = 0
     for case in CASES:
         print(f"\n[ref] --- {case['name']}")
+        request = {"state": STATE, "questions": case["questions"]}
         try:
-            body = post(url, {"state": STATE, "questions": case["questions"]},
-                        args.triton)
-        except (urllib.error.URLError, urllib.error.HTTPError, ValueError) as exc:
+            if args.endpoint:
+                body = post_endpoint(args.endpoint, args.region, request)
+            else:
+                body = post(url, request, args.triton)
+        # Broad on purpose. This is a gate: any failure to get an answer is a failure of
+        # the gate, and the exception types differ by transport (urllib's URLError here,
+        # botocore's ClientError/EndpointConnectionError there). Naming them all would mean
+        # importing botocore on the HTTP path, and missing one would turn a red gate into a
+        # traceback that reads like a bug in this script.
+        except Exception as exc:
             detail = ""
             if isinstance(exc, urllib.error.HTTPError):
                 try:

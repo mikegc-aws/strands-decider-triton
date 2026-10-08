@@ -140,13 +140,93 @@ def _tags(extra: dict | None = None) -> list[dict]:
     return [{"Key": k, "Value": v} for k, v in tags.items()]
 
 
-def ensure_model(sm, name: str, image: str, role: str, env: dict, replace: bool) -> str:
+def config_fingerprint(image: str, instance: str, variant: str, engine: str,
+                       env: list[str], model_data_url: str) -> str:
+    """Hash of everything an endpoint config decides, so changing any of it renames it.
+
+    This is load-bearing, not cosmetic. `UpdateEndpoint` is the only way to move a live
+    endpoint, and it refuses a config it is already serving:
+      ValidationException: Cannot update endpoint with the currently in use endpoint
+      configuration "strands-decider-g6-config"
+    With a fixed name, `--replace` deletes and recreates the config *under the same name*,
+    so there is nothing new to point at -- and a name-equality check (which is all
+    `DescribeEndpoint` gives you) then concludes the endpoint is already correct and
+    silently does nothing. MEASURED: a deploy of a new image reported success and left the
+    old image serving.
+
+    `env` and `model_data_url` are in the hash because both change what the container
+    serves. Omitting them is the same bug one level along: a `--env SD_FUSE_LAYERS=1`
+    deploy would land on the existing config name and update nothing.
+    """
+    return hashlib.sha256(
+        json.dumps([image, instance, variant, engine, sorted(env), model_data_url],
+                   sort_keys=True).encode()).hexdigest()[:10]
+
+
+def apply_env_overrides(env: dict, items: list[str]) -> dict:
+    """Merge `KEY=VALUE` strings over the base container environment.
+
+    Split on the FIRST `=` only, because a value may legitimately contain one, and refuse an
+    item without one rather than silently setting a variable to the empty string -- which is
+    indistinguishable from "off" to the backend's `param()` and would quietly deploy the
+    default while the command line said otherwise.
+    """
+    merged = dict(env)
+    for item in items:
+        if "=" not in item:
+            raise ValueError(f"--env wants KEY=VALUE, got {item!r}")
+        key, value = item.split("=", 1)
+        merged[key] = value
+    return merged
+
+
+def container_drift(current: dict, desired: dict) -> list[str]:
+    """Which fields of an existing model's container no longer match what we would create.
+
+    This exists for the same reason `cfg_fingerprint` does, one level down. A model is
+    immutable -- there is no UpdateModel -- and `ensure_model` used to reuse any model that
+    merely had the right NAME. So changing only the container environment (the supported way
+    to flip `SD_FUSE_LAYERS` or `SD_CUDA_GRAPHS` without rebuilding the image: see
+    model.py's `param()`, where the environment wins over config.pbtxt) found the old model,
+    reused it, and deployed the OLD setting while reporting success. That is a benchmark
+    that silently measures the wrong thing, which is worse than a failed deploy.
+
+    Compared field by field rather than by equality so the message says what moved.
+    """
+    drift = []
+    if current.get("Image") != desired.get("Image"):
+        drift.append("Image")
+    if (current.get("Environment") or {}) != (desired.get("Environment") or {}):
+        drift.append("Environment")
+    if (current.get("ModelDataUrl") or "") != (desired.get("ModelDataUrl") or ""):
+        drift.append("ModelDataUrl")
+    return drift
+
+
+def ensure_model(sm, name: str, image: str, role: str, env: dict, replace: bool,
+                 model_data_url: str = "") -> str:
+    # No ModelDataUrl by default: the weights are baked into the image, so there is no
+    # 4.6 GB S3 download on every scale-out. Supplying one extracts the archive OVER
+    # /opt/ml/model, which is where the Triton model repository lives -- so a small archive
+    # containing `decider/config.pbtxt` and `decider/1/model.py` is how a Triton-level knob
+    # (`instance_group count`, `max_batch_size`) is changed without a 20.6 GB rebuild. The
+    # archive must therefore carry the WHOLE `decider/` directory, because the extraction
+    # may replace the directory rather than merge into it.
+    container = {"Image": image, "Environment": env}
+    if model_data_url:
+        container["ModelDataUrl"] = model_data_url
+
     try:
-        sm.describe_model(ModelName=name)
-        if not replace:
+        current = sm.describe_model(ModelName=name)["PrimaryContainer"]
+        drift = container_drift(current, container)
+        if not replace and not drift:
             print(f"[model] {name} exists; reusing (--replace to recreate)")
             return name
-        print(f"[model] deleting {name}")
+        if drift:
+            print(f"[model] {name} exists but its container differs ({', '.join(drift)}); "
+                  "recreating rather than serving the old one")
+        else:
+            print(f"[model] deleting {name}")
         sm.delete_model(ModelName=name)
     except ClientError as exc:
         if exc.response["Error"]["Code"] not in ("ValidationException", "ResourceNotFound"):
@@ -156,11 +236,7 @@ def ensure_model(sm, name: str, image: str, role: str, env: dict, replace: bool)
     sm.create_model(
         ModelName=name,
         ExecutionRoleArn=role,
-        # No ModelDataUrl: the weights are baked into the image, so there is no 4.6 GB S3
-        # download on every scale-out. If you do supply one, SageMaker untars it to
-        # /opt/ml/model and the entrypoint prefers it -- but the archive must have
-        # strands_decider_config.json (or hobson_config.json) at its ROOT, not nested.
-        PrimaryContainer={"Image": image, "Environment": env},
+        PrimaryContainer=container,
         Tags=_tags(),
     )
     return name
@@ -436,6 +512,16 @@ def main() -> int:
                          "serve, so scale-out must be requested early")
     ap.add_argument("--engine", default="merged", choices=["merged", "hf"],
                     help="which forward pass the Triton backend builds")
+    ap.add_argument("--env", action="append", default=[], metavar="KEY=VALUE",
+                    help="extra container environment, repeatable. The backend's param() "
+                         "lets the environment win over config.pbtxt, so this is how a "
+                         "tuning knob is flipped without rebuilding a 20.6 GB image -- "
+                         "e.g. --env SD_FUSE_LAYERS=1 or --env SD_CUDA_GRAPHS=1")
+    ap.add_argument("--model-data-url", default="",
+                    help="s3:// archive extracted over /opt/ml/model, i.e. over the Triton "
+                         "model repository. The way to change a Triton-level knob "
+                         "(instance_group count, max_batch_size) with no rebuild: pack the "
+                         "whole decider/ directory with the edited config.pbtxt")
     ap.add_argument("--replace", action="store_true")
     ap.add_argument("--no-wait", action="store_true")
     ap.add_argument("--delete", action="store_true")
@@ -445,24 +531,14 @@ def main() -> int:
     model_name = f"{args.name}-model"
     endpoint_name = args.name
 
-    # The endpoint config name carries a hash of what it configures, so changing the
-    # image (or instance type, or env) produces a NEW name.
-    #
-    # This is load-bearing, not cosmetic. `UpdateEndpoint` is the only way to move a live
-    # endpoint, and it refuses a config it is already serving:
-    #   ValidationException: Cannot update endpoint with the currently in use endpoint
-    #   configuration "strands-decider-g6-config"
-    # With a fixed name, `--replace` deletes and recreates the config *under the same
-    # name*, so there is nothing new to point at -- and a name-equality check (which is
-    # all `DescribeEndpoint` gives you) then concludes the endpoint is already correct and
-    # silently does nothing. Measured: a deploy of a new image reported success and left
-    # the old image serving. Hashing the content makes the comparison meaningful.
+    # The endpoint config name carries a hash of what it configures, so changing the image
+    # (or instance type, or engine, or env) produces a NEW name. See
+    # `config_fingerprint` for why that matters.
     #
     # Old configs are left behind deliberately: they cost nothing, and keeping them means
     # a rollback is `--image <previous>`, which resolves to a config that already exists.
-    cfg_fingerprint = hashlib.sha256(
-        json.dumps([args.image, args.instance_type, args.variant, args.engine],
-                   sort_keys=True).encode()).hexdigest()[:10]
+    cfg_fingerprint = config_fingerprint(args.image, args.instance_type, args.variant,
+                                         args.engine, args.env, args.model_data_url)
     config_name = f"{args.name}-config-{cfg_fingerprint}"
 
     if args.delete:
@@ -496,8 +572,13 @@ def main() -> int:
         "SD_ENGINE": args.engine,
         "SD_PREFIX_CACHE": "1",
     }
+    try:
+        env = apply_env_overrides(env, args.env)
+    except ValueError as exc:
+        ap.error(str(exc))
 
-    ensure_model(sm, model_name, args.image, role, env, args.replace)
+    ensure_model(sm, model_name, args.image, role, env, args.replace,
+                 model_data_url=args.model_data_url)
     ensure_endpoint_config(sm, config_name, model_name, args.instance_type,
                            args.variant, args.replace)
     ensure_endpoint(sm, endpoint_name, config_name)

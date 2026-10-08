@@ -9,6 +9,10 @@ worth a regression test because each has a silent failure mode:
   * the autoscaling ceiling against the account's real quota. Getting this wrong produces an
     endpoint that reports healthy, never scales, and records the refusal only in a scaling
     activity log (see `create_endpoint.endpoint_usage_quota`).
+  * what identifies a model and an endpoint config. Both are immutable, both are reused by
+    NAME, and both therefore have a failure mode where a deploy reports success and leaves
+    the previous settings serving -- which turns an A/B into a comparison of one thing with
+    itself (see `create_endpoint.config_fingerprint` and `container_drift`).
   * `tools/loadsweep_triton.py` being importable without running a load sweep.
 
 The scripts are loaded by path rather than imported, because `deploy/` and `tools/` are
@@ -128,6 +132,84 @@ def test_zero_quota_refuses_rather_than_deploying_something_unplaceable(
                         lambda region, instance_type: 0.0)
     with pytest.raises(SystemExit, match="quota in this account is 0"):
         create_endpoint.resolve_max_capacity("us-west-2", "ml.g6.24xlarge", 4)
+
+
+# ----------------------------------------------- what identifies a model and a config
+
+
+def test_config_fingerprint_moves_with_every_field_it_configures(create_endpoint):
+    """A config name that does not move makes UpdateEndpoint a no-op, and the deploy then
+    reports success while the old container keeps serving. `--env` and `--model-data-url`
+    are the two newest ways to reach that bug, so they are asserted explicitly."""
+    fp = create_endpoint.config_fingerprint
+    base = fp("img:a", "ml.g6e.2xlarge", "AllTraffic", "merged", [], "")
+    assert base == fp("img:a", "ml.g6e.2xlarge", "AllTraffic", "merged", [], ""), \
+        "the fingerprint must be stable, or every re-run leaks a config"
+    assert base != fp("img:b", "ml.g6e.2xlarge", "AllTraffic", "merged", [], "")
+    assert base != fp("img:a", "ml.g6e.4xlarge", "AllTraffic", "merged", [], "")
+    assert base != fp("img:a", "ml.g6e.2xlarge", "AllTraffic", "hf", [], "")
+    assert base != fp("img:a", "ml.g6e.2xlarge", "AllTraffic", "merged",
+                      ["SD_FUSE_LAYERS=1"], "")
+    assert base != fp("img:a", "ml.g6e.2xlarge", "AllTraffic", "merged", [],
+                      "s3://b/ig2.tar.gz")
+
+
+def test_config_fingerprint_ignores_the_order_env_was_given_in(create_endpoint):
+    """Two deploys that differ only in argument order are the same deployment, and giving
+    them different config names would leave an orphan behind for nothing."""
+    fp = create_endpoint.config_fingerprint
+    a = fp("i", "t", "v", "merged", ["A=1", "B=2"], "")
+    b = fp("i", "t", "v", "merged", ["B=2", "A=1"], "")
+    assert a == b
+
+
+def test_env_overrides_split_on_the_first_equals_only(create_endpoint):
+    """A value may contain `=`. Splitting on all of them would silently truncate it."""
+    merged = create_endpoint.apply_env_overrides({"SD_ENGINE": "merged"},
+                                                 ["SD_FUSE_LAYERS=1", "X=a=b"])
+    assert merged == {"SD_ENGINE": "merged", "SD_FUSE_LAYERS": "1", "X": "a=b"}
+
+
+def test_env_override_can_replace_a_default(create_endpoint):
+    """The point of the flag: the backend's param() lets the environment win over
+    config.pbtxt, so this is how a knob is flipped without a 20.6 GB rebuild."""
+    merged = create_endpoint.apply_env_overrides({"SD_PREFIX_CACHE": "1"},
+                                                 ["SD_PREFIX_CACHE=0"])
+    assert merged["SD_PREFIX_CACHE"] == "0"
+
+
+def test_env_override_refuses_a_bare_key(create_endpoint):
+    """`--env SD_FUSE_LAYERS` would otherwise set it to "", which param() reads as OFF --
+    i.e. it would deploy the default while the command line asked for the opposite."""
+    with pytest.raises(ValueError, match="KEY=VALUE"):
+        create_endpoint.apply_env_overrides({}, ["SD_FUSE_LAYERS"])
+
+
+def test_container_drift_catches_an_environment_only_change(create_endpoint):
+    """There is no UpdateModel, and `ensure_model` reuses a model by name. Before this
+    guard, `--env SD_FUSE_LAYERS=1` found the existing model, reused it, and benchmarked
+    the UNFUSED torso while reporting a successful fused deploy."""
+    current = {"Image": "img:a", "Environment": {"SD_ENGINE": "merged"}}
+    desired = {"Image": "img:a", "Environment": {"SD_ENGINE": "merged",
+                                                 "SD_FUSE_LAYERS": "1"}}
+    assert create_endpoint.container_drift(current, desired) == ["Environment"]
+
+
+def test_container_drift_is_empty_when_nothing_moved(create_endpoint):
+    """Idempotence matters: a re-run must not delete and recreate a model that is correct,
+    because deleting one that an endpoint config references is a trap for the next deploy."""
+    same = {"Image": "img:a", "Environment": {"SD_ENGINE": "merged"}}
+    assert create_endpoint.container_drift(same, dict(same)) == []
+    # An absent ModelDataUrl and an empty one are the same deployment.
+    assert create_endpoint.container_drift({**same, "ModelDataUrl": ""}, dict(same)) == []
+
+
+def test_container_drift_catches_a_model_data_url(create_endpoint):
+    """The model repository overlay. It is how `instance_group count` is changed without a
+    rebuild, so a reused model here would measure count: 1 three times and call it a sweep."""
+    current = {"Image": "img:a", "Environment": {}}
+    desired = {"Image": "img:a", "Environment": {}, "ModelDataUrl": "s3://b/ig2.tar.gz"}
+    assert create_endpoint.container_drift(current, desired) == ["ModelDataUrl"]
 
 
 # ------------------------------------------------------------------- the tool guards
