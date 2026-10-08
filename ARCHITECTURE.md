@@ -453,6 +453,7 @@ assemble a big batch and then split it anyway. That is measurable: raising
 | `max_rows` | `BatchedSystemOneEngine` | 128 | activation memory for the whole in-flight batch |
 | `DUP_TOKEN_BUDGET` | `BatchedSystemOneEngine` | 480 | the one-pass/two-pass threshold, in duplicated state tokens |
 | `SD_ENGINE` | container env | `merged` | `merged` folds the LoRA; `hf` is for A/B only and needs an image built with `peft` |
+| `SD_FUSE_LAYERS` | container env | `0` (off) | replaces the torso's decoder layers with `flash-linear-attention`'s Triton kernels (`src/strands_decider/fused_layers.py`). Measured 1.29x on a full 56-row batch, 0.85x at batch 1. Opt-in because it changes the rounding. Verified at load by five kernel-contract probes that refuse to fuse rather than half-fuse |
 
 ### Why more model copies made it slower
 
@@ -514,11 +515,24 @@ raised median utilisation to 100% while doing 10% less work.
 Stated plainly so you do not discover it in production:
 
 - **Latency is dispatch-bound; throughput at saturation is bandwidth-bound.** The ~45 ms
-  floor is CPU kernel-launch overhead and is what one small pass pays; cutting it is the
-  largest remaining win *for latency*. Plain CUDA-graph capture was measured on this torso
-  and **does not work** — the shapes that go fast return wrong values. A loaded server is a
-  different regime: see §8, "Why more model copies made it slower". Do not quote the 45 ms
-  floor as a throughput ceiling.
+  floor is CPU kernel-launch overhead (~5,676 launches) against a 12.7 ms weight-streaming
+  floor, and it is what one *small* pass pays — cutting it is the largest remaining win
+  *for latency*. Plain CUDA-graph capture was measured on this torso and does not work: the
+  shapes that go fast return wrong values. Once the batcher has filled a pass with ~56
+  question rows the model leaves that regime and is **memory-bandwidth-bound** instead: an
+  L40S with 2.88x the bandwidth delivers 2.7x the decisions/s on the same configuration. Do
+  not quote the 45 ms floor as a throughput ceiling; see §8, "Why more model copies made it
+  slower".
+- **The two regimes reward opposite things**, and `SD_FUSE_LAYERS=1` is the clearest
+  demonstration: fla's fused Triton kernels do less arithmetic and move less data but carry
+  more Python per op, so they measure **1.29x on a full 56-row batch and 0.85x at batch 1,
+  128 tokens**. Pick the optimisation for the regime you are actually in; no single number
+  covers both. See [README's fused-kernels section](README.md#fused-kernels-sd_fuse_layers1).
+- **Latency numbers from a load generator on this box are not trustworthy.** A `g6.xlarge`
+  has 4 vCPUs, so a co-resident `bench_tickets.py` competes with the server for the exact
+  resource a dispatch-bound model is short of; the same cell measured 0.67 and 10.87
+  tickets/s on two runs an hour apart. Drive load from a separate in-region host, or measure
+  the engine in-process (`tools/fused_ab.py --batch-time`) where there is no client at all.
 - **A single question costs almost as much as three.** Same reason: you are paying for the
   pass, not the work.
 - **Under load, latency becomes queueing.** At 32 requests in flight a 7-question ticket sits

@@ -101,16 +101,26 @@ def build_merged_model(
     merged_torso: str,
     *,
     attn_implementation: str | None = None,
+    torch_dtype: str | None = None,
 ) -> StrandsDeciderModel:
     """A `StrandsDeciderModel` with a pre-merged torso and no PEFT wrapper.
 
     The head, tokenizer, window and fitted temperatures still come from the Decider
     checkpoint -- `merge_lora.py` writes only the torso and the tokenizer, by design, so
     the calibration lives in exactly one place.
+
+    `torch_dtype` overrides the checkpoint's own (`bfloat16`). It exists for one job:
+    `tools/fused_ab.py --fp32-reference` loads the torso in fp32 to decide whether a
+    probability difference between two kernel paths is rounding or a bug -- the bf16
+    reference and the fused path can then both be measured against the same higher-precision
+    answer instead of only against each other. It is **not** a serving knob: fp32 doubles the
+    weight footprint and roughly halves throughput for a difference no caller can see.
     """
     ckpt = checkpoint_dir(checkpoint)
     config = StrandsDeciderConfig.from_json(config_path(ckpt))
     config.base_revision = base_revision(ckpt, config)
+    if torch_dtype:
+        config.torch_dtype = torch_dtype
 
     if not os.path.isdir(merged_torso):
         raise FileNotFoundError(
@@ -171,6 +181,7 @@ def load_merged_engine(
     model_name: str = "strands-decider-merged",
     attn_implementation: str | None = None,
     max_rows: int = 128,
+    fuse_layers: bool | None = None,
 ) -> SystemOneEngine:
     """A `BatchedSystemOneEngine` over a pre-merged torso.
 
@@ -184,6 +195,14 @@ def load_merged_engine(
     per-pass floor across every request in flight instead of paying it per request. A
     server that does not know about `evaluate_many` simply never calls it, so this is a
     safe default rather than a behaviour change.
+
+    `fuse_layers` replaces the torso's decoder layers with fla's Triton kernels (see
+    `fused_layers.py`). `None` reads `SD_FUSE_LAYERS`, which defaults to off: fusion changes
+    the rounding, and the reference path is what every published number here was measured
+    on. It is applied *after* the engine has moved the model to its device, because the
+    kernel-contract probes run on the real weights on the real GPU, and it raises rather
+    than falling back -- a half-fused torso still answers, which is the failure this project
+    exists to refuse.
     """
     model = build_merged_model(checkpoint, merged_torso,
                               attn_implementation=attn_implementation)
@@ -196,4 +215,10 @@ def load_merged_engine(
     )
     from .batch_engine import BatchedSystemOneEngine
 
-    return BatchedSystemOneEngine(model, cfg, max_rows=max_rows)
+    engine = BatchedSystemOneEngine(model, cfg, max_rows=max_rows)
+
+    from .fused_layers import fuse_enabled, fuse_torso
+
+    if fuse_enabled() if fuse_layers is None else fuse_layers:
+        fuse_torso(engine.model.torso)
+    return engine
