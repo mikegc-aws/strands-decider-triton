@@ -1,12 +1,16 @@
 """Fused inference kernels for the Qwen3.5 torso, behind `SD_FUSE_LAYERS=1`.
 
-Why. This deployable is **dispatch-bound, not compute-bound**: one forward pass on an L4
-costs `max(45 ms, tokens x 0.0935 ms)`, and the 45 ms floor is ~5,676 CPU kernel launches
-against a 12.7 ms weight-streaming floor (see `batch_engine.py` and README's "Known
-limits"). Prefill runs at ~34% of the card's peak. Cross-request batching already spread
-that floor across every request in flight; the remaining win is to *launch fewer kernels
-per pass*, which is what this module does. The LoRA merge took 17,574 CUDA ops down to
-9,411 (`merged_engine.py`); this takes aim at what is left.
+Why. A *small* pass on this deployable is dispatch-bound -- `max(45 ms, tokens x 0.0935 ms)`
+on an L4, where the 45 ms floor is ~5,676 CPU kernel launches against a 12.7 ms
+weight-streaming floor (see `batch_engine.py`). A *full* pass is not: once the batcher fills
+one with ~56 question rows it is memory-bandwidth-bound, and prefill runs at ~34% of the
+card's peak. Cross-request batching already spread the per-pass floor across every request
+in flight, so what is left to win is the GPU work itself -- fewer kernels, less arithmetic,
+less traffic -- which is what this module goes after. The LoRA merge took 17,574 CUDA ops
+down to 9,411 (`merged_engine.py`); this takes aim at what remains.
+
+That distinction is not a footnote: it is why the numbers below go in opposite directions at
+batch 1 and at batch 56, and why this is a throughput lever rather than a latency one.
 
 What the reference spends the launches on, and what replaces it, per decoder layer:
 
@@ -16,7 +20,8 @@ What the reference spends the launches on, and what replaces it, per decoder lay
 | `causal_conv1d_fn` = a PyTorch depthwise `F.conv1d`, behind a    | fla's Triton causal conv, started from   |
 | `torch.cat` of the cached conv state (`Cache.update_conv_state`) | the cached state, no concatenation       |
 | gate `-exp(A_log)*softplus(a+dt_bias)`, `beta.sigmoid()` and the | computed inside the chunk kernel         |
-| q/k `repeat_interleave` as fp32 elementwise ops                  | key heads shared by value heads (GVA)    |
+| q/k `repeat_interleave` as fp32 elementwise ops (not on THIS     | key heads shared by value heads (GVA)    |
+| checkpoint: 16 key heads to 16 value heads, so it never runs)    |                                          |
 | `Qwen3_5RMSNormGated` as ~6 elementwise ops                     | fla's fused gated RMSNorm                |
 | 2 GEMMs for the MLP gate and up, then `silu(g)*u`               | 1 GEMM and a fused SwiGLU                |
 | 2 zero-centred `Qwen3_5RMSNorm`s plus a residual add            | fla's fused RMSNorm, the second adding   |
