@@ -118,7 +118,38 @@ def observability_policy(region: str, account: str) -> dict:
     }
 
 
-def ensure_execution_role(region: str, account: str, name: str) -> str:
+MODEL_DATA_POLICY_NAME = "strands-decider-model-data"
+
+
+def model_data_policy(url: str) -> dict:
+    """Read exactly one S3 archive, for a deploy that passes `--model-data-url`.
+
+    Normally this role needs NO S3 at all -- the weights are baked into the image, which is
+    why `ECR_READ_POLICY` plus logs is the whole grant. A model-repository overlay (the
+    no-rebuild route to a Triton-level knob like `instance_group count`) is the one case
+    that adds an S3 read, and without it `CreateEndpoint` fails minutes later with
+      Could not access model data at s3://... Please ensure that the role can access it
+    which reads like a bad URL rather than a missing permission.
+
+    Scoped to the single object, and `ListBucket` to its key alone: SageMaker issues a
+    HeadObject/ListObjectsV2 before the GET, and a bucket-wide list grant is a wider hole
+    than this needs.
+    """
+    bucket, _, key = url.removeprefix("s3://").partition("/")
+    return {
+        "Version": "2012-10-17",
+        "Statement": [
+            {"Effect": "Allow", "Action": "s3:GetObject",
+             "Resource": f"arn:aws:s3:::{bucket}/{key}"},
+            {"Effect": "Allow", "Action": "s3:ListBucket",
+             "Resource": f"arn:aws:s3:::{bucket}",
+             "Condition": {"StringEquals": {"s3:prefix": key}}},
+        ],
+    }
+
+
+def ensure_execution_role(region: str, account: str, name: str,
+                          model_data_url: str = "") -> str:
     """Create or reuse the SageMaker execution role, and return its ARN.
 
     The sleep at the end is not superstition. IAM is eventually consistent across its own
@@ -156,8 +187,15 @@ def ensure_execution_role(region: str, account: str, name: str) -> str:
         PolicyName=OBSERVABILITY_POLICY_NAME,
         PolicyDocument=json.dumps(observability_policy(region, account)),
     )
-    print(f"[role] policies in place ({Path(ECR_READ_POLICY).name}, "
-          f"{OBSERVABILITY_POLICY_NAME})")
+    policies = [Path(ECR_READ_POLICY).name, OBSERVABILITY_POLICY_NAME]
+    if model_data_url:
+        iam.put_role_policy(
+            RoleName=name,
+            PolicyName=MODEL_DATA_POLICY_NAME,
+            PolicyDocument=json.dumps(model_data_policy(model_data_url)),
+        )
+        policies.append(MODEL_DATA_POLICY_NAME)
+    print(f"[role] policies in place ({', '.join(policies)})")
 
     if created:
         print("[role] waiting 15s for IAM propagation before SageMaker uses it")
@@ -365,7 +403,15 @@ def main() -> int:
             env={"BOX_ID": args.box_id, "REGION": args.region,
                  "BUCKET": bucket, "REPO": args.repo})
 
-    role = args.role or ensure_execution_role(args.region, account, args.role_name)
+    if args.role and args.model_data_url:
+        # Not modified here on purpose: a role passed in belongs to the operator, and
+        # silently widening someone else's role is worse than a clear instruction.
+        print(f"[role] NOTE: --model-data-url needs s3:GetObject on "
+              f"{args.model_data_url} and {args.role} is yours to grant it on. Without it "
+              "CreateEndpoint fails with 'Could not access model data at s3://...', which "
+              "reads like a bad URL rather than a missing permission.")
+    role = args.role or ensure_execution_role(args.region, account, args.role_name,
+                                              model_data_url=args.model_data_url)
 
     endpoint_cmd = [sys.executable, str(HERE / "create_endpoint.py"),
                     "--image", image, "--role", role, "--name", args.name,

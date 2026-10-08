@@ -86,6 +86,21 @@ def test_observability_policy_scopes_logs_to_sagemaker_groups(up):
     assert metrics[0]["Condition"]["StringEquals"]["cloudwatch:namespace"]
 
 
+def test_model_data_policy_is_scoped_to_one_object(up):
+    """This role normally needs no S3 at all -- the weights are in the image. The one case
+    that adds a read is a model-repository overlay, and it must stay an object-level grant:
+    a bucket-wide `s3:GetObject` on `*` would be a far wider hole than the one archive the
+    deploy named."""
+    policy = up.model_data_policy("s3://sd-exchange-123/overlays/ig2.tar.gz")
+    get = [s for s in policy["Statement"] if s["Action"] == "s3:GetObject"]
+    assert get[0]["Resource"] == "arn:aws:s3:::sd-exchange-123/overlays/ig2.tar.gz"
+    assert "*" not in get[0]["Resource"]
+    listing = [s for s in policy["Statement"] if s["Action"] == "s3:ListBucket"]
+    assert listing[0]["Resource"] == "arn:aws:s3:::sd-exchange-123"
+    assert (listing[0]["Condition"]["StringEquals"]["s3:prefix"]
+            == "overlays/ig2.tar.gz")
+
+
 def test_execution_role_does_not_grant_sagemaker_full_access(up):
     """AmazonSageMakerFullAccess is the usual copy-paste and grants S3, IAM PassRole and the
     whole SageMaker API to a role whose only job is to pull a container and write logs. The
