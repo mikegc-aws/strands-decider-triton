@@ -60,7 +60,7 @@ forward passes in total rather than two per ticket.
 | Latency, 1 question | **47 ms** |
 | Latency, 7 questions | **67 ms** (9.6 ms per decision) |
 | Latency, 7 questions + a ~400-token attached document | 104 ms |
-| Throughput at saturation | **~99 decisions/s** (~14 tickets/s, ~36,000 tickets/hour) |
+| Throughput at saturation | **~99 decisions/s** (~14 tickets/s, ~50,000 tickets/hour) |
 | Cost | $1.1267/hr hosting → **~$0.022 per 1,000 tickets** at full load |
 | Correctness | **0 decision mismatches** against the model's published reference values (max Δp 0.0020) |
 | Cold start | ~12 min to `InService` (dominated by the 20.6 GB image pull); ~25 s container start with a warm kernel cache |
@@ -74,6 +74,16 @@ costs ~14% of throughput, because the state is paid once per ticket rather than 
 question.
 
 ## Layout
+
+[ARCHITECTURE.md](ARCHITECTURE.md) explains how the serving layer works and why — the
+cost model, what Triton is and is not for, and how this deployable differs from the plain
+FastAPI server. Read it before changing the tuning knobs below.
+
+[CLIENT.md](CLIENT.md) is the handover document for another project calling the deployed
+endpoint: coordinates, IAM, the envelope, a drop-in client, and the error contract.
+[notebooks/decider_playground.ipynb](notebooks/decider_playground.ipynb) is the same
+client in a notebook, with runnable examples of all three question types, the batching
+and concurrency effects, and the error contract.
 
 ```
 src/strands_decider/      the model, prompt rendering, engines
@@ -95,8 +105,34 @@ deploy/
   create_endpoint.py      model, endpoint config, endpoint, autoscaling (boto3)
 serving/merge_lora.py     the build-time LoRA merge
 tools/                    verification and measurement, see below
-tests/                    64 unit tests, no GPU or AWS needed
+tests/                    80 unit tests, no GPU or AWS needed
 ```
+
+### What this repo is *not*
+
+It is the **serving slice** of a larger private tree, extracted so the deployable can stand
+on its own. Training, evaluation, the data pipeline and the vLLM deployable stayed behind.
+
+Comments and docstrings here still cite that tree, because the citation is where a measured
+number came from and removing it would leave a bare claim. Those paths are **not in this
+repository** and that is expected, not a broken link:
+
+| cited | what it was | here? |
+| --- | --- | --- |
+| `evaluation/`, JevBench | the accuracy and device-parity suites | no |
+| `data/collate.py` | training-time option shuffling | no |
+| `serving/README.md`, `serving/vllm_server.py`, `vllm_engine.py` | the vLLM deployable and its notes | no |
+| `tests/test_prefix_cache.py`, `tests/test_mps_kernels.py` | tests for code that is included | no |
+| `research/…/BENCHMARK.md`, `LambdaGpuLaunchDemo` | the comparison numbers and the build-box pattern | no |
+| `/opt/prof/*`, `/opt/tctx/*` | scratch paths on the GPU build box | no |
+| `strands-decider serve`, `… calibrate`, `… data build` | the parent package's CLI | no — there is no `strands-decider` console script here |
+
+Two consequences worth knowing before you read the source. `src/strands_decider/` is
+importable but has **no CLI**, so where a docstring says `strands-decider serve <ckpt>`,
+the equivalent here is `strands_decider.server.create_app(...)` or `serve(...)`. And
+`mlx_engine.py` / `vision.py` / `mps_kernels.py` are carried along because `infer.py`
+imports into them, but neither the MLX nor the vision path is exercised by this
+deployable — the Triton image is CUDA and text-only.
 
 ## Running it
 
@@ -104,7 +140,7 @@ tests/                    64 unit tests, no GPU or AWS needed
 
 ```bash
 python -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
-.venv/bin/python -m pytest -q          # 64 passed
+.venv/bin/python -m pytest -q          # 80 passed
 ```
 
 Use the venv. The system interpreter usually lacks `fastapi`/`torch`, and the failure
@@ -145,12 +181,23 @@ reuses the model and config and leaves a healthy endpoint alone:
 
 ```bash
 deploy/create_endpoint.py --image <same> --role <same> \
-  --name strands-decider-g6 --target-invocations 600
+  --name strands-decider-g6 --target-invocations 250
 ```
 
-600 invocations per instance per minute is ~25% of the measured ceiling, so a second
-instance comes up while p50 is still ~200 ms rather than after it has degraded. Default
-capacity is 1–4 instances with a **warm floor of 1**: GPU cold start is minutes, so
+**Pick this target from the measured ceiling, and note it is per instance per *minute*.**
+Saturation is ~14 tickets/s, i.e. ~840 invocations/instance/minute, so:
+
+| target | share of ceiling | effect |
+| --- | --- | --- |
+| 250 | ~30% | a second instance is requested while p50 is still ~100 ms. Recommended |
+| 600 | ~70% | scale-out is requested only once the instance is well into queueing — p50 is heading toward the ~615 ms above before help arrives |
+
+600 was deployed first, described here as "~25% of the ceiling", and that was wrong
+arithmetic rather than a different measurement. It matters more than it looks because a new
+instance takes **~12 minutes** to serve traffic, so the target has to fire well before the
+current one is in trouble — target tracking is not a brake you can apply late.
+
+Default capacity is 1–4 instances with a **warm floor of 1**: GPU cold start is minutes, so
 scale-to-zero is not appropriate for latency-sensitive traffic.
 
 Teardown: `deploy/create_endpoint.py --name strands-decider-g6 --delete`.
@@ -230,3 +277,16 @@ loud:
   can be dropped in without changing the server. A vLLM pooling engine is a reasonable
   alternative at short inputs but gives up the shared-state optimisation, which is what
   makes long documents cheap here.
+
+## Licence
+
+Apache-2.0 — see [LICENSE](LICENSE).
+
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) records what this derives from: the Gated
+DeltaNet chunk rule in `mps_kernels.py` is a modified Apache-2.0 file from `transformers`,
+and the scheduler's shape and the hybrid cache fork are credited there too. All three
+upstreams are Apache-2.0.
+
+**No model weights are in this repository.** The image downloads the checkpoint at build
+time; it carries its own licence, which this repository neither alters nor restates. Check
+it before redistributing an image you have built.
