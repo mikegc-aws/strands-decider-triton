@@ -34,6 +34,7 @@ requires for a modified file.
 ## 2. `kev` — the async-handler / bounded-queue / single-device-thread pattern
 
 **Used in:** `src/strands_decider/scheduler.py`
+**Upstream:** https://github.com/jaredpalmer/kev
 **Licence:** Apache License 2.0
 
 `Scheduler` follows the shape `kev` uses for serving a single non-re-entrant device behind
@@ -58,12 +59,72 @@ than sharing them, because a Gated DeltaNet layer updates its states and its
 
 ---
 
-## A note on the two entries above without a URL
+## 4. `kev` — the fused Qwen3.5 inference layers
 
-`kev` and `decider-2b` are named as they are named in the source comments, and both are
-recorded there as Apache-2.0. If either is publicly hosted, a link belongs here — open an
-issue or a PR and it will be added. The attribution is given on the strength of the
-source's own record rather than omitted for want of a URL.
+**Used in:** `src/strands_decider/fused_layers.py`
+**Upstream:** `kev/fused_qwen35.py` (https://github.com/jaredpalmer/kev)
+**Licence:** Apache License 2.0
+
+`fused_layers.py` is a **port**, not a copy: the same approach applied to the torso
+`merged_engine.load_merged_torso` builds, which is a different wrapper from `kev`'s.
+
+**What was taken.** The diagnosis — that `transformers`' reference Qwen3.5 layers spend over
+a third of their GPU time outside the matrix multiplies, on a PyTorch depthwise conv behind
+a concatenation of the cached conv state, on a dozen fp32 elementwise kernels per DeltaNet
+layer for the gating, the head repeat and the gated norm, and on several more per RMSNorm
+and SwiGLU. The remedy, which is the choice of `flash-linear-attention` ops and how they map
+onto the reference layers: one projection GEMM for q/k/v/z/b/a with the weights concatenated;
+fla's Triton causal conv started from the cached conv state rather than from a concatenation
+of it; fla's chunked gated delta rule with the gate `-exp(A_log)*softplus(a + dt_bias)`, the
+beta sigmoid and the q/k L2 norm computed inside the kernel and key heads shared by value
+heads; fla's fused gated RMSNorm; one GEMM for the MLP gate and up with a fused SwiGLU; the
+decoder layer's two zero-centred RMSNorms as fla's fused RMSNorm with weight `1 + w` in fp32,
+the second also adding the residual; and for the attention layers one GEMM for q (with its
+packed output gate), k and v, with the q/k RMSNorms and the sigmoid output gate fused. The
+structure of the four replacement forwards follows `kev`'s, and so does the observation that
+this is a serving-only rewrite with no backward pass.
+
+**What changed.**
+
+- **The cache contract is the reference's.** `kev`'s DeltaNet forward does not advance a
+  cached state on a pass that continues one, because its question rows never continue from
+  each other. The same holds here, but this port writes the conv and recurrent states back
+  exactly where `Cache.update_conv_state` / `update_recurrent_state` would, so the fused and
+  reference paths cannot diverge in cache behaviour. `infer._fork_layered_cache` and
+  `batch_engine._gather_layered_cache` depend on in-place state updates, and that invariant
+  must not depend on which kernels happen to be installed.
+- **The assumptions are verified on the GPU before the first request.**
+  `fused_layers.verify_kernels` adds five probes with no counterpart upstream, each comparing
+  a fused kernel against the reference expression it replaces: the zero-centred RMSNorm
+  identity, the gated RMSNorm, the in-kernel gate and beta, the GVA head grouping, and the
+  conv-state continuation. They exist because each of those assumptions fails silently — an
+  fla release that swallowed `use_gate_in_kernel` into `**kwargs` would still return a
+  well-formed probability distribution. `check_layout` likewise refuses an unrecognised
+  layer layout rather than fusing part of a torso.
+- **The fused weights are non-persistent buffers, not bare attributes**, so
+  `nn.Module.to` moves them and `state_dict` does not carry them.
+- **`_fix_nb` is not ported.** Upstream forces fla's `NB` launch constant to 1 to stop a busy
+  server re-autotuning on every new batch shape. In the pinned 0.5.2, `NB` is
+  `cdiv(T, 65536)` rather than `cdiv(T, ~2000)`, so it changes far less often, and patching a
+  dependency's kernel-launch internals is not something this repository can verify. It is
+  recorded as a possible future win instead.
+- The torso's final `norm` is left unfused (one kernel per pass, not per layer), the
+  variable-length (`cu_seqlens`) path is refused rather than ignored, and fusion is opt-in
+  behind `SD_FUSE_LAYERS` with the reference path as the default.
+
+No file is copied verbatim, so no modified-file notice is carried in the source; this entry
+is the attribution and `fused_layers.py`'s docstring points here.
+
+---
+
+## A note on the entry above without a URL
+
+`decider-2b` is named as it is named in the source comments, and is recorded there as
+Apache-2.0. If it is publicly hosted, a link belongs here — open an issue or a PR and it
+will be added. The attribution is given on the strength of the source's own record rather
+than omitted for want of a URL. (`kev` was in the same position until
+`fused_layers.py` was ported from it; the link added to entries 2 and 4 is the same
+repository.)
 
 ---
 

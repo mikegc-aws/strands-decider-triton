@@ -453,6 +453,7 @@ assemble a big batch and then split it anyway. That is measurable: raising
 | `max_rows` | `BatchedSystemOneEngine` | 128 | activation memory for the whole in-flight batch |
 | `DUP_TOKEN_BUDGET` | `BatchedSystemOneEngine` | 480 | the one-pass/two-pass threshold, in duplicated state tokens |
 | `SD_ENGINE` | container env | `merged` | `merged` folds the LoRA; `hf` is for A/B only and needs an image built with `peft` |
+| `SD_FUSE_LAYERS` | container env | `0` (off) | replaces the torso's decoder layers with `flash-linear-attention`'s Triton kernels (`src/strands_decider/fused_layers.py`). Opt-in because it changes the rounding. Verified at load by five kernel-contract probes that refuse to fuse rather than half-fuse. **Not recommended on by default** — see below |
 
 ---
 

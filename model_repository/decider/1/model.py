@@ -88,6 +88,12 @@ class TritonPythonModel:
         prefix_cache = param("SD_PREFIX_CACHE", "1") not in ("0", "false", "no", "off")
         device = param("SD_DEVICE", "cuda")
         max_batch = int(param("SD_MAX_BATCH", "32"))
+        # Opt-in fused kernels (strands_decider/fused_layers.py). Off by default: fusion
+        # changes the rounding, and the reference path is what every published number in
+        # this repository was measured on. `load_merged_engine` refuses rather than
+        # half-fusing, so a bad value here fails `initialize()` and Triton never reports
+        # ready -- which is the correct outcome, not an inconvenience.
+        fuse_layers = param("SD_FUSE_LAYERS", "0") not in ("0", "false", "no", "off", "")
 
         self._assert_fla_on_gpu(device)
 
@@ -99,6 +105,7 @@ class TritonPythonModel:
                 checkpoint, merged, device=device,
                 use_prefix_cache=prefix_cache, max_batch=max_batch,
                 model_name="strands-decider-triton",
+                fuse_layers=fuse_layers,
             )
         elif engine_kind == "hf":
             # NOTE: the shipped image does NOT carry `peft`, by design -- the LoRA is
@@ -106,6 +113,15 @@ class TritonPythonModel:
             # unmerged checkpoint at runtime. So this arm only works in an image built
             # with peft present. It exists for A/B against the merged torso, and it fails
             # with that explanation rather than a bare ImportError from three frames down.
+            if fuse_layers:
+                # Refused rather than ignored: silently serving the unfused torso after
+                # being asked for the fused one would make a benchmark comparison a lie,
+                # and the A/B between the two is the whole reason SD_ENGINE=hf exists.
+                raise pb_utils.TritonModelException(
+                    "SD_FUSE_LAYERS=1 is not supported with SD_ENGINE=hf: the fused "
+                    "kernels replace the torso's layers in place and PEFT wraps them, so "
+                    "the adapter would be bypassed. Use SD_ENGINE=merged."
+                )
             try:
                 from strands_decider.infer import load_engine
             except ImportError as exc:
@@ -127,7 +143,7 @@ class TritonPythonModel:
             )
         self.logger.log_info(
             f"[decider] {engine_kind} engine loaded in {time.perf_counter() - started:.1f}s "
-            f"(prefix_cache={prefix_cache}, device={device})"
+            f"(prefix_cache={prefix_cache}, device={device}, fused_layers={fuse_layers})"
         )
         if param("SD_WARMUP", "1") not in ("0", "false", "no", "off"):
             self._warmup()
