@@ -23,13 +23,34 @@ What the reference spends the launches on, and what replaces it, per decoder lay
 |                                                                 | the residual                             |
 | attention: 3 GEMMs, 2 head RMSNorms, `out * sigmoid(gate)`      | 1 GEMM, fused norms, fused sigmoid gate  |
 
+What it bought, measured on this deployable's L4 (`tools/fused_ab.py`), and why it is still
+**off by default**:
+
+    full batch, 8 tickets x 7 questions (56 rows)   540 ms -> 419 ms   1.29x
+      (103.8 -> 133.7 decisions/s; fused faster in 7 of 7 interleaved rounds)
+    torso forward, batch 1,   128 tokens             42 ms ->  49 ms   0.85x  SLOWER
+    torso forward, batch 1, 1,024 tokens             84 ms ->  73 ms   1.14x
+
+The win is in the saturated regime and the loss is at batch 1, which is the two regimes
+behaving differently rather than a surprise: one small pass is CPU-dispatch-bound, and fla's
+ops carry *more* Python per call (`input_guard`, autotune lookups, an autograd `Function`)
+even while launching fewer kernels, whereas a 56-row pass is memory-bandwidth-bound -- the
+deploy measurements put an L40S at 2.7x an L4's throughput for 2.88x its bandwidth -- and
+there doing less arithmetic and moving less data is exactly what helps. On a 4-vCPU
+g6.xlarge the Python side is not cheap. So this is a throughput lever, not a latency one.
+
 The *math* is the reference's. The *rounding* is not: the fused kernels keep fp32 where the
 reference rounds to bf16 in between (`Qwen3_5RMSNormGated` does
-`self.weight * hidden_states.to(input_dtype)` mid-formula, for instance). So fused and
-reference answers agree to bf16 noise, in the same band this project already accepts for
-batching and for the LoRA merge -- 7e-3 on probabilities, zero decision flips. That band is
-not a hope: `tools/fused_ab.py` measures it and `tools/batch_parity.py` /
-`tools/reference_check.py` gate it.
+`self.weight * hidden_states.to(input_dtype)` mid-formula, for instance). Measured over 80
+answers across both readout routes: **zero decision flips**, mean |dp| 0.0011-0.0019, max
+0.0102. The max is above this project's 7e-3 advisory band, and `--fp32-reference` is what
+settles whether that matters: against the same torso in fp32 the reference bf16 path sits
+0.00105 away on average and the fused path 0.00124, a 1.18x difference with the
+per-primitive maxima not ordering consistently. Both bf16 paths are about equally close to
+the exact answer and simply not close to each other, which is rounding rather than a kernel
+error. `kev` records the same magnitude for its own bf16 path (max 0.0133, mean 0.0014 from
+fp32, zero argmax flips, L40S). `tools/batch_parity.py` and `tools/reference_check.py` both
+pass with fusion on, at zero flips and zero mismatches.
 
 Provenance. The approach, the choice of fla ops and the structure of the four replacement
 forwards are a port of `kev/fused_qwen35.py` (Apache-2.0); see THIRD_PARTY_NOTICES.md for
@@ -66,6 +87,10 @@ Scope and limits, stated rather than discovered later:
     verified against. A different version refuses to fuse rather than fusing on an
     unverified contract.
   * The torso's final `self.norm` is left alone: it is one kernel per pass, not per layer.
+  * **This checkpoint has 16 linear key heads and 16 value heads**, so the reference's
+    `repeat_interleave` of q/k never runs and the "no head repeat" part of the port buys
+    nothing here. The GVA path and its probe are kept because they cost nothing and the next
+    checkpoint may not be 1:1, but do not credit the speed-up above to them.
 """
 
 from __future__ import annotations

@@ -254,7 +254,7 @@ requests batched alongside it.
 | `tools/reference_check.py` | reproduces the model's published reference values. The strongest end-to-end check: it validates prompt rendering, the window fit, option spans, the pointer readout, the fitted temperatures, the confidence formulas, the folded LoRA and the wire format at once. Gate: zero decision mismatches. |
 | `tools/triton_smoke.sh` | starts the image the way SageMaker does (`docker run <image> serve`) and checks readiness, all three primitives, batching, caller errors, and that warm-up covered the shapes. |
 | `tools/batch_parity.py` | cross-request batching against the single-request path. Gate: **zero decision flips**; probability drift is advisory (≤7e-3 — batching changes bf16 reduction order). |
-| `tools/fused_ab.py` | the fused kernels (`SD_FUSE_LAYERS=1`) against the reference torso: same requests, both readout routes, max and mean \|Δp\| per primitive, plus the torso forward timed both ways. `--fp32-reference` runs the same torso in fp32 as an arbiter, because two bf16 paths can differ by more than either differs from the exact answer. Gate: **zero decision flips**. |
+| `tools/fused_ab.py` | the fused kernels (`SD_FUSE_LAYERS=1`) against the reference torso: same requests, both readout routes, max and mean \|Δp\| per primitive, plus the torso forward timed both ways. `--fp32-reference` runs the same torso in fp32 as an arbiter, because two bf16 paths can differ by more than either differs from the exact answer. `--batch-time` times `evaluate_many` on a full Triton batch in-process, with no HTTP and no load generator — the only speed measurement this box can take honestly. Gate: **zero decision flips**. |
 | `tools/bench_tickets.py` | tickets/s, decisions/s and per-decision latency by question count, ticket length and concurrency. Use `--tickets distinct` (the default). |
 | `tools/sm_sweep.py`, `tools/loadsweep_triton.py` | load sweeps through the endpoint and straight to the container. Both record GPU utilisation alongside throughput, so a saturated card is distinguishable from a starved load generator. |
 
@@ -282,6 +282,65 @@ loud:
 | `max_rows` | `BatchedSystemOneEngine` | 128 question rows per pass. Activation memory for the whole in-flight batch. |
 | `DUP_TOKEN_BUDGET` | `BatchedSystemOneEngine` | 480. Above this many duplicated state tokens, encoding the state once and forking the cache beats a single combined pass. |
 | `SD_ENGINE`, `SD_PREFIX_CACHE` | container env | `merged` folds the LoRA into the torso (no PEFT at runtime). Prefix caching on. |
+| `SD_FUSE_LAYERS` | container env | **0 (off)**. `1` swaps the torso's decoder layers for `flash-linear-attention`'s Triton kernels — see [Fused kernels](#fused-kernels-sd_fuse_layers1) below. Measured **1.29x** on a full 56-row batch (103.8 → 133.7 decisions/s) and *slower* at batch 1. Correctness gates pass; the numbers move. |
+
+## Fused kernels (`SD_FUSE_LAYERS=1`)
+
+`src/strands_decider/fused_layers.py` rewrites the torso's decoder layers for inference
+using `flash-linear-attention`'s Triton kernels: one projection GEMM per DeltaNet mixer
+instead of four, fla's causal conv started from the cached conv state rather than from a
+`torch.cat` of it, the gate / beta sigmoid / q-k L2 norm inside the chunk kernel, fla's
+fused gated RMSNorm, one GEMM plus a fused SwiGLU for the MLP, and the two zero-centred
+RMSNorms as fla's fused norm with the second adding the residual. It is a port of
+[`kev`](https://github.com/jaredpalmer/kev)'s `fused_qwen35.py` — see
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+**It is off by default, and that is a measurement, not caution.** Measured on this
+deployable's L4, `tools/fused_ab.py`:
+
+| | reference | fused | |
+| --- | --- | --- | --- |
+| **Full batch, 8 tickets × 7 questions** (56 rows — the shape `max_batch_size: 8` produces), least-contended pair | 540 ms / **103.8 decisions/s** | 419 ms / **133.7 decisions/s** | **1.29x** |
+| …across 7 interleaved rounds | 540–1,154 ms | 419–895 ms | 1.05–1.99x, fused faster in **7 of 7** |
+| Torso forward, batch 1, 128 tokens | 42 ms | 49 ms | **0.85x — fused is slower** |
+| Torso forward, batch 1, 1,024 tokens | 84 ms | 73 ms | 1.14x |
+
+The reference row is a useful check on the method: measured in-process it lands at
+~101–104 decisions/s across rounds, against the ~99 decisions/s this README's live-endpoint
+table reports at saturation.
+
+So the win is in the **saturated** regime and the loss is at batch 1. That is consistent
+with what the two regimes are: one small pass is CPU-dispatch-bound, and fla's ops carry
+more Python per call (`input_guard`, autotune lookups, an autograd `Function`) even though
+they launch fewer kernels — while a 56-row pass is memory-bandwidth-bound, where doing less
+arithmetic and moving less data is what helps. On a 4-vCPU `g6.xlarge` the Python side is
+not cheap.
+
+These come from `tools/fused_ab.py --batch-time`, which calls the engine **in-process** with
+no HTTP and no load generator. That is deliberate: see
+[ARCHITECTURE.md §9](ARCHITECTURE.md#9-what-this-does-not-do) for why a co-resident
+`bench_tickets.py` cannot measure this model on a 4-vCPU box.
+
+Correctness, all three gates green with fusion on:
+
+| check | result |
+| --- | --- |
+| `tools/reference_check.py` | **0 decision mismatches** against the published v21 values (Δ noul 0.0018, Δp 0.0020, Δscore 0.0031) |
+| `tools/batch_parity.py` | **0 decision flips**; max \|Δp\| 0.0086 (0.0064 unfused) |
+| `tools/fused_ab.py`, 80 answers over both readout routes | **0 decision flips**; mean \|Δp\| 0.0011–0.0019, max 0.0102 |
+
+The max is above this project's 7e-3 advisory band and the mean is well inside it. `--fp32-reference`
+settles which: run the *same* torso in fp32 as an arbiter and the reference bf16 path sits
+0.00105 from it on average, the fused path 0.00124 — a 1.18x difference, with the
+per-primitive maxima not ordering consistently. Both bf16 paths are about equally close to
+the exact answer; they are simply not close to each other, which is what rounding looks like
+and a systematic kernel error does not. `kev` records the same magnitude for its own bf16
+path on an L40S (max 0.0133, mean 0.0014 from fp32, zero argmax flips).
+
+**But it does move the numbers a caller sees**, by up to ~0.01 on a probability, so it is
+opt-in. Turning it on refuses rather than degrades: `fuse_torso` checks the layer layout and
+runs five kernel-contract probes on the GPU before rewriting anything, and raises — failing
+`initialize()` and keeping Triton from reporting ready — if any of them has moved.
 
 ## Known limits
 
@@ -289,7 +348,10 @@ loud:
   on an L4 that is CPU kernel-launch overhead (~5,676 launches) against a 12.7 ms
   weight-streaming floor, and prefill runs at ~34% of the card's peak. Cutting that floor
   is the largest remaining serving win. Plain CUDA-graph capture was measured on this torso
-  and does not work — the shapes that go fast return wrong values.
+  and does not work — the shapes that go fast return wrong values. **That premise holds for
+  one small pass and not for a full one:** at 56 question rows the pass is
+  memory-bandwidth-bound instead, which is why fused kernels help there (1.07–1.42x) and
+  hurt at batch 1 (0.85x). The two optimisations serve different regimes.
 - **`instance_group count: 2` is untested** and is the cheapest untried lever.
 - A single question costs almost as much as three, for the same reason: you are paying for
   the pass, not the work.

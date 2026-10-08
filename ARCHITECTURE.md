@@ -453,7 +453,7 @@ assemble a big batch and then split it anyway. That is measurable: raising
 | `max_rows` | `BatchedSystemOneEngine` | 128 | activation memory for the whole in-flight batch |
 | `DUP_TOKEN_BUDGET` | `BatchedSystemOneEngine` | 480 | the one-pass/two-pass threshold, in duplicated state tokens |
 | `SD_ENGINE` | container env | `merged` | `merged` folds the LoRA; `hf` is for A/B only and needs an image built with `peft` |
-| `SD_FUSE_LAYERS` | container env | `0` (off) | replaces the torso's decoder layers with `flash-linear-attention`'s Triton kernels (`src/strands_decider/fused_layers.py`). Opt-in because it changes the rounding. Verified at load by five kernel-contract probes that refuse to fuse rather than half-fuse. **Not recommended on by default** — see below |
+| `SD_FUSE_LAYERS` | container env | `0` (off) | replaces the torso's decoder layers with `flash-linear-attention`'s Triton kernels (`src/strands_decider/fused_layers.py`). Measured 1.29x on a full 56-row batch, 0.85x at batch 1. Opt-in because it changes the rounding. Verified at load by five kernel-contract probes that refuse to fuse rather than half-fuse |
 
 ---
 
@@ -465,6 +465,18 @@ Stated plainly so you do not discover it in production:
   overhead, and prefill runs at ~34% of the card's peak. Cutting that floor is the largest
   remaining win. Plain CUDA-graph capture was measured on this torso and **does not work** —
   the shapes that go fast return wrong values.
+- **That premise is about ONE SMALL PASS, not a saturated server.** Once the batcher fills a
+  pass with ~56 question rows the model is memory-bandwidth-bound instead. The two regimes
+  reward opposite things, and `SD_FUSE_LAYERS=1` is the clearest demonstration: fla's fused
+  Triton kernels do less arithmetic and move less data but carry more Python per op, so they
+  are measured at **1.29x on a full 56-row batch and 0.85x at batch 1, 128 tokens**.
+  Pick the optimisation for the regime you are actually in; do not assume one number covers
+  both. See [README's fused-kernels section](README.md#fused-kernels-sd_fuse_layers1).
+- **Latency numbers from a load generator on this box are not trustworthy.** A `g6.xlarge`
+  has 4 vCPUs, so a co-resident `bench_tickets.py` competes with the server for the exact
+  resource a dispatch-bound model is short of; the same cell measured 0.67 and 10.87
+  tickets/s on two runs an hour apart. Drive load from a separate in-region host, or measure
+  the engine in-process (`tools/fused_ab.py --batch-time`) where there is no client at all.
 - **A single question costs almost as much as three.** Same reason: you are paying for the
   pass, not the work.
 - **Under load, latency becomes queueing.** At 32 requests in flight a 7-question ticket sits

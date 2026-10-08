@@ -231,6 +231,64 @@ def time_torso(checkpoint: str, merged: str, device: str, *, fused: bool,
     return out
 
 
+BATCH_TICKETS = 8   # config.pbtxt's max_batch_size: what a full Triton batch looks like
+
+
+def time_batch(checkpoint: str, merged: str, device: str, max_rows: int, *,
+               fused: bool, repeats: int) -> dict[str, float]:
+    """Time `evaluate_many` on a full Triton batch: 8 distinct tickets x 7 questions.
+
+    This is the measurement that matters and the only one this box can take honestly.
+
+    `bench_tickets.py` drives the server over HTTP from a load generator, and on this
+    g6.xlarge the generator is **co-resident on 4 vCPUs** with a model whose cost is partly
+    CPU dispatch. The client and the server then compete for the exact resource under test,
+    and the numbers wander by 2-3x between runs -- at concurrency 8 one run gave 0.67
+    tickets/s with a 13.4 s server p50, which is a measurement of the client, not the model.
+    A second agent sharing the card makes it worse.
+
+    So: no HTTP, no threads, no queueing. One process calls the engine directly on the shape
+    `config.pbtxt` actually produces (8 requests x 7 questions = 56 question rows, over the
+    `DUP_TOKEN_BUDGET` so it takes the two-pass route), with `cuda.synchronize` around it.
+    What is left is GPU work and this process's own dispatch, which is what a kernel change
+    is allowed to be judged on.
+
+    56 rows is also the regime the deploy measurements say is **memory-bandwidth-bound**
+    rather than dispatch-bound (an L40S with 2.88x the bandwidth of an L4 gave 2.7x the
+    throughput, near-linear). Fused kernels reduce arithmetic and memory traffic, so this is
+    where they should pay even though they lose at batch 1.
+    """
+    import torch
+
+    from strands_decider.merged_engine import load_merged_engine
+    from strands_decider.schema import SystemOneRequest
+
+    engine = load_merged_engine(checkpoint, merged, device=device, use_prefix_cache=True,
+                               max_rows=max_rows, fuse_layers=fused)
+
+    from strands_decider.fused_layers import is_fused
+    if is_fused(engine.model.torso) != fused:
+        raise SystemExit("[ab] torso fusion state does not match the label")
+
+    # Distinct states, so nothing de-duplicates and the batch is the honest 8-state shape.
+    tickets = [f"Ticket {i}: {MEDIUM}" for i in range(BATCH_TICKETS)]
+    requests = [SystemOneRequest(state=t, questions=dict(QUESTIONS)) for t in tickets]
+    n_decisions = BATCH_TICKETS * len(QUESTIONS)
+
+    for _ in range(3):
+        engine.evaluate_many(requests)
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(repeats):
+        engine.evaluate_many(requests)
+    torch.cuda.synchronize()
+    per_batch_ms = (time.perf_counter() - t0) * 1000.0 / repeats
+
+    return {"ms_per_batch": round(per_batch_ms, 2),
+            "decisions_per_s": round(n_decisions * 1000.0 / per_batch_ms, 1),
+            "rows": float(n_decisions)}
+
+
 def compare(ref: dict, got: dict, warn: float) -> int:
     """Report the comparison and return the number of decision flips."""
     missing = sorted(set(ref) ^ set(got))
@@ -373,7 +431,26 @@ def main() -> int:
     ap.add_argument("--tokens", default="128,512,1024,3072")
     ap.add_argument("--repeats", type=int, default=20)
     ap.add_argument("--out", default="", help="write the full comparison to this JSON file")
+    ap.add_argument("--batch-time", action="store_true",
+                    help="time evaluate_many on a full Triton batch (8 tickets x 7 questions)")
+    ap.add_argument("--only", choices=["reference", "fused"], default="",
+                    help="run one torso only and exit. With --batch-time, lets a shell loop "
+                         "interleave the two modes so background load on a shared box "
+                         "averages across both instead of landing on one")
     args = ap.parse_args()
+
+    if args.only:
+        # One mode, one line, nothing else. The interleaving is the caller's job.
+        if not args.batch_time:
+            raise SystemExit("[ab] --only is for --batch-time; without it there is nothing "
+                             "to compare against")
+        out = time_batch(args.checkpoint, args.merged, args.device, args.max_rows,
+                         fused=args.only == "fused", repeats=args.repeats)
+        print(f"[ab] BATCHTIME mode={args.only} rows={out['rows']:.0f} "
+              f"ms_per_batch={out['ms_per_batch']} "
+              f"decisions_per_s={out['decisions_per_s']}")
+        print("[ab] FUSED_AB_FINISHED")
+        return 0
 
     specs = cases()
     print(f"[ab] {len(specs)} cases, "
