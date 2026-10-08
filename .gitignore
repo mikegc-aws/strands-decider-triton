@@ -20,3 +20,12 @@ __pycache__/
 # derives that bucket name) and quoted in the docs.
 *.log
 /tmp/
+
+# One-off probes and the SSM runner used to drive the GPU box. The findings they produced
+# belong in the docstrings and the report, not in the tree -- a probe that is kept but not
+# maintained is a probe that lies the next time someone runs it.
+/.scratch/
+
+# Agent worktrees and session scratch. These are checkouts of this same repository, so
+# committing them would nest a git repo inside itself.
+.claude/

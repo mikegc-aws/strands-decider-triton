@@ -88,12 +88,29 @@ class TritonPythonModel:
         prefix_cache = param("SD_PREFIX_CACHE", "1") not in ("0", "false", "no", "off")
         device = param("SD_DEVICE", "cuda")
         max_batch = int(param("SD_MAX_BATCH", "32"))
-        # Opt-in fused kernels (strands_decider/fused_layers.py). Off by default: fusion
-        # changes the rounding, and the reference path is what every published number in
-        # this repository was measured on. `load_merged_engine` refuses rather than
-        # half-fusing, so a bad value here fails `initialize()` and Triton never reports
-        # ready -- which is the correct outcome, not an inconvenience.
+        # Two independent, opt-in accelerators, both OFF by default because each changes
+        # the arithmetic slightly and the eager reference path is what every published
+        # number in this repository was measured on. They serve opposite regimes: graphs
+        # cut single-request latency, fusion raises saturated throughput. See
+        # README.md, "Known limits".
+
+        # Fused kernels (strands_decider/fused_layers.py). `load_merged_engine` refuses
+        # rather than half-fusing, so a bad value here fails `initialize()` and Triton
+        # never reports ready -- the correct outcome, not an inconvenience.
         fuse_layers = param("SD_FUSE_LAYERS", "0") not in ("0", "false", "no", "off", "")
+
+        # CUDA graph capture (strands_decider/cuda_graphs.py). Removes the ~45 ms per-pass
+        # CPU dispatch floor on the one-pass route.
+        #
+        #   0    eager everywhere (the default)
+        #   1    graph the one-pass route -- measured 45.9 ms -> 21.5 ms server p50 for a
+        #        one-question request on an L4
+        #   all  additionally graph the state/row pair, which measured 0.73x-1.02x on the
+        #        same card and so is deliberately NOT included in `1`
+        graph_mode = param("SD_CUDA_GRAPHS", "0").strip().lower()
+        cuda_graphs = graph_mode not in ("0", "false", "no", "off")
+        cuda_graphs_two_pass = graph_mode in ("all", "2", "two-pass", "two_pass")
+
 
         self._assert_fla_on_gpu(device)
 
@@ -106,6 +123,8 @@ class TritonPythonModel:
                 use_prefix_cache=prefix_cache, max_batch=max_batch,
                 model_name="strands-decider-triton",
                 fuse_layers=fuse_layers,
+                cuda_graphs=cuda_graphs,
+                cuda_graphs_two_pass=cuda_graphs_two_pass,
             )
         elif engine_kind == "hf":
             # NOTE: the shipped image does NOT carry `peft`, by design -- the LoRA is
@@ -198,6 +217,49 @@ class TritonPythonModel:
         self.logger.log_info(
             f"[decider] warm-up covered {3 * len(shapes)} shapes in "
             f"{time.perf_counter() - started:.1f}s")
+        self._warmup_graphs(noul, choice, score)
+
+    def _warmup_graphs(self, noul, choice, score) -> None:
+        """Drive `evaluate_many` so the CUDA-graph buckets are captured before readiness.
+
+        The sweep above goes through `evaluate`, which never touches `evaluate_many` and so
+        never reaches a graph. Capturing costs ~0.4 s per shape, and a bucket is only
+        captured after it has run eagerly `HOT_BUCKET` times -- so each shape is driven a
+        few times here and then captured, rather than leaving the first real caller of each
+        shape to pay for it. No-op when graphs are off: `capture_pending` returns 0.
+        """
+        from strands_decider.schema import SystemOneRequest
+
+        engine = self.engine
+        if not hasattr(engine, "capture_pending"):
+            return
+        started = time.perf_counter()
+        # Both routes, across the state lengths the envelope covers: few questions take the
+        # one-pass (combined) graph, several take the state+rows pair. 7 is the shape the
+        # published latency numbers use.
+        plans = [(16, 1), (16, 3), (256, 1), (256, 3), (256, 7), (600, 7), (900, 7)]
+        questions = {"a": noul, "b": choice, "c": score,
+                     "d": noul, "e": choice, "f": score, "g": noul}
+        names = list(questions)
+        for approx_tokens, n in plans:
+            state = "warm up the kernels for this state length. " * max(
+                1, approx_tokens // 10)
+            request = SystemOneRequest(
+                state=state, questions={k: questions[k] for k in names[:n]})
+            for _ in range(3):  # > HOT_BUCKET, so the bucket is hot enough to capture
+                try:
+                    engine.evaluate_many([request])
+                except Exception as exc:
+                    self.logger.log_warn(
+                        f"[decider] graph warm-up failed at ~{approx_tokens} tokens, "
+                        f"{n} question(s): {exc}")
+                    break
+            engine.capture_pending()
+        stats = getattr(engine, "graph_stats", dict)()
+        if stats:
+            self.logger.log_info(
+                f"[decider] cuda graphs after warm-up: {stats} in "
+                f"{time.perf_counter() - started:.1f}s")
 
     def _assert_fla_on_gpu(self, device: str) -> None:
         """Refuse to start if the Gated DeltaNet layers are on the CPU reference path.
@@ -234,6 +296,22 @@ class TritonPythonModel:
                 "cause is no C compiler in the image -- Triton builds its CUDA driver shim "
                 "at runtime and needs gcc, libc6-dev and python3-dev."
             )
+
+    # How many requests between CUDA-graph stats lines. Operationally this is the only way
+    # to tell a server that is replaying graphs from one that quietly fell back to the
+    # eager path on every shape -- the answers are identical either way, so nothing else
+    # would report it, and "it got slower at some point" is a terrible bug report.
+    GRAPH_STATS_EVERY = 200
+
+    def _log_graph_stats(self, n: int) -> None:
+        stats = getattr(self.engine, "graph_stats", dict)()
+        if not stats:
+            return
+        self._seen = getattr(self, "_seen", 0) + n
+        if self._seen >= getattr(self, "_next_stats", 0):
+            self._next_stats = self._seen + self.GRAPH_STATS_EVERY
+            self.logger.log_info(f"[decider] cuda graphs after {self._seen} "
+                                 f"request(s): {stats}")
 
     def _group_by_state(self, parsed: list) -> dict:
         """Group a Triton batch by rendered state, preserving each request's slot.
@@ -278,6 +356,7 @@ class TritonPythonModel:
         n = len(requests)
         responses: list = [None] * n
         parsed: list = [None] * n
+        self._log_graph_stats(n)
 
         # ---- decode. A bad payload is the caller's error and must not fail its
         # neighbours in the batch, so it is answered immediately and skipped below.

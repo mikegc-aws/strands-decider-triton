@@ -172,5 +172,28 @@ parameters [
     # The HF shared-state cache. ON: it is why this engine exists rather than vLLM.
     key: "SD_PREFIX_CACHE"
     value: { string_value: "1" }
+  },
+  {
+    # CUDA graph capture. OFF by default. `0` | `1` | `all`.
+    #
+    # `1` graphs the one-pass route, where the ~45 ms per-pass floor is CPU kernel launches
+    # rather than arithmetic: measured 45.9 ms -> 21.5 ms server p50 for a one-question
+    # request on an L4, at 64 MiB of fixed buffers.
+    #
+    # `all` additionally graphs the state/row pair. It measured 0.73x-1.02x -- i.e. mostly
+    # slower -- and costs 1,188 MiB, so it is deliberately not part of `1`. The reason is
+    # not capture: a graph cannot branch, so the state pass must always carry an explicit
+    # mask, which loses the causal flash attention kernel the eager path gets for free.
+    #
+    # Every published number in README.md was measured with this off, which is the other
+    # reason it is opt-in. `SD_CUDA_GRAPHS` in the container environment overrides this
+    # value without rebuilding the model repository.
+    #
+    # Shapes outside the graphed envelope (a state over 1,024 tokens, a question over 256)
+    # run the eager path, in the same call, with no configuration. So does every shape if
+    # capture fails -- on a shared card it can fail with CUDA OOM. See
+    # src/strands_decider/cuda_graphs.py.
+    key: "SD_CUDA_GRAPHS"
+    value: { string_value: "0" }
   }
 ]

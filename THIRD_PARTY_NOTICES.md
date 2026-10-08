@@ -114,6 +114,65 @@ this is a serving-only rewrite with no backward pass.
 
 No file is copied verbatim, so no modified-file notice is carried in the source; this entry
 is the attribution and `fused_layers.py`'s docstring points here.
+---
+
+## 5. `kev` — CUDA graph capture over a hybrid (attention + Gated DeltaNet) torso
+
+**Used in:** `src/strands_decider/cuda_graphs.py`
+**Upstream:** https://github.com/jaredpalmer/kev, `kev/cuda_graphs.py`
+**Licence:** Apache License 2.0
+
+`kev` serves the same class of backbone — a Qwen3.5 hybrid, ~18 Gated DeltaNet linear
+attention layers plus full-attention layers, through the same `flash-linear-attention`
+library — and had already solved capture on it. Four ideas are taken from that file, and
+`cuda_graphs.py`'s own docstring records them as borrowed:
+
+1. **Precomputing the attention masks and passing them in as a dict** keyed by layer type,
+   so transformers never builds a mask inside the captured region. This is the whole
+   difference between "captures but returns stale answers" and correct replay, and it is
+   why this repository's README previously (and correctly, for what it had tested) reported
+   that CUDA graphs do not work on this torso.
+2. **The fixed-layout state bank**: per layer, attention keys and values in one flat buffer
+   with each state right-aligned at a fixed width, plus the Gated DeltaNet conv and
+   recurrent states, so a question-row pass reads any state the same way whichever state
+   pass wrote it. `BufferKV`, `set_linear` and `Buffers` follow `kev`'s structure closely;
+   `Buffers.views`' flat-buffer-then-view arithmetic is essentially theirs.
+3. **Shape bucketing** — `bucket()` for token counts, `count_bucket()` for row and state
+   counts, `length_groups()`'s dynamic programme for splitting rows into padded passes.
+   These are ports, with the docstrings rewritten.
+4. **The exact padding masks**, including the trap that gives the idea its force: a pad
+   query must attend to itself so that no row is fully masked, because `NaN * 0 = NaN` and
+   one unused pad row would otherwise poison the rows beside it.
+
+What is different here:
+
+- **It is wired into a different engine.** `kev` has one `run(requests)` entry point over
+  its own `Request`/`_Row` types and its own serving loop. This is wired into
+  `BatchedSystemOneEngine`'s two existing routes, so the graphed passes return hidden
+  states in exactly the coordinates the eager readout already uses and the probability
+  readout, temperatures and confidence formulas are untouched.
+- **A third graphed pass that `kev` does not have.** `combined()` covers this engine's
+  one-pass route (`state + question` per row, no cache at all), which is what a request
+  with few questions takes and where the measured win is largest. `kev` graphs only a state
+  pass and a row pass.
+- **No prefix cache in the graph path.** `kev`'s `states()` returns a `DynamicCache` per
+  kept state and `load_state()` copies a cached state back into the bank. This engine
+  recomputes the state per request, so both are dropped and the two-pass route is
+  all-or-nothing: if the state pass is outside the envelope, the row pass runs eagerly too.
+- **Different capture policy and different limits.** `kev` captures when its model thread
+  is idle, which a Triton python backend has no notion of; here warm-up captures the common
+  shapes before the server reports ready, and a bucket is captured after `HOT_BUCKET` eager
+  runs. The envelope constants are re-measured for an L4 and a 2B model rather than carried
+  over from an H100/L40S and a 4B one.
+- **Explicitly locked.** One lock covers a pass and its copy-out, because these buffers are
+  shared and two concurrent passes would answer one caller from another's hidden states.
+- **`inference_mode`, not `no_grad`**, on every public method: this engine allocates the
+  buffers on a path that is already inside `inference_mode`, so they are inference tensors
+  and writing to one from outside raises.
+
+No lines are copied verbatim. The structure of `BufferKV.update`, `set_linear`,
+`Buffers.views`, `bucket`, `count_bucket` and `length_groups` is close enough to `kev`'s
+that they should be read as derived work, which is what this section records.
 
 ---
 
@@ -122,9 +181,8 @@ is the attribution and `fused_layers.py`'s docstring points here.
 `decider-2b` is named as it is named in the source comments, and is recorded there as
 Apache-2.0. If it is publicly hosted, a link belongs here — open an issue or a PR and it
 will be added. The attribution is given on the strength of the source's own record rather
-than omitted for want of a URL. (`kev` was in the same position until
-`fused_layers.py` was ported from it; the link added to entries 2 and 4 is the same
-repository.)
+than omitted for want of a URL. (`kev` was in the same position until `fused_layers.py`
+and `cuda_graphs.py` were ported from it; entries 2, 4 and 5 are all the same repository.)
 
 ---
 

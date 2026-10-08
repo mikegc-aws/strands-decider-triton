@@ -16,9 +16,15 @@ without changing anything above the forward pass.
 
 Measured, with a correctness check behind it rather than a throughput number alone:
 0 of 6 decision flips against the unmerged torso, max `|Δnoul|` 0.0078 and max
-`|Δscore|` 0.0033. (CUDA graph capture over this torso was measured on the same hardware
-and does **not** work -- it returns wrong values at every shape where it is fast, and no
-speedup at the shapes where it is correct. Do not reach for it here.)
+`|Δscore|` 0.0033.
+
+This docstring used to end "CUDA graph capture over this torso was measured on the same
+hardware and does **not** work -- it returns wrong values at every shape where it is fast.
+Do not reach for it here." That was a true measurement of *plain* capture and it is no
+longer the whole story: the wrong values came from transformers building its attention
+masks inside the captured region, where a host-side branch is baked in rather than
+recorded. Hand the masks in precomputed and replay is bit-identical to eager. See
+`cuda_graphs.py`, which is opt-in through `SD_CUDA_GRAPHS` and off by default.
 
 Unlike the vLLM engine this keeps the **shared-prefix path**, which is the torch engine's
 real advantage: it encodes the state once and forks its cache across the questions, where
@@ -182,6 +188,8 @@ def load_merged_engine(
     attn_implementation: str | None = None,
     max_rows: int = 128,
     fuse_layers: bool | None = None,
+    cuda_graphs: bool = False,
+    cuda_graphs_two_pass: bool = False,
 ) -> SystemOneEngine:
     """A `BatchedSystemOneEngine` over a pre-merged torso.
 
@@ -203,6 +211,19 @@ def load_merged_engine(
     kernel-contract probes run on the real weights on the real GPU, and it raises rather
     than falling back -- a half-fused torso still answers, which is the failure this project
     exists to refuse.
+
+    `cuda_graphs` is off by default and opt-in through `SD_CUDA_GRAPHS=1`. It replaces the
+    per-pass CPU dispatch with a graph replay on the ONE-pass route, which is where the
+    ~45 ms launch floor dominates: measured 45.9 ms -> 21.5 ms server-side for a
+    one-question request on an L4. `cuda_graphs_two_pass` (`SD_CUDA_GRAPHS=all`) extends it
+    to the state/row pair and is off even then, because it was measured at 0.73x-1.02x
+    there; `BatchedSystemOneEngine.__init__` records the numbers and the cause. Both fall
+    back to the eager path whenever capture is unavailable or a shape sits outside the
+    graphed envelope; see `cuda_graphs.py`.
+
+    The two are independent and compose, but their ORDER here is load-bearing -- see the
+    comment at the bottom of this function.
+
     """
     model = build_merged_model(checkpoint, merged_torso,
                               attn_implementation=attn_implementation)
@@ -215,10 +236,19 @@ def load_merged_engine(
     )
     from .batch_engine import BatchedSystemOneEngine
 
-    engine = BatchedSystemOneEngine(model, cfg, max_rows=max_rows)
+    engine = BatchedSystemOneEngine(model, cfg, max_rows=max_rows,
+                                    cuda_graphs=cuda_graphs,
+                                    cuda_graphs_two_pass=cuda_graphs_two_pass)
 
     from .fused_layers import fuse_enabled, fuse_torso
 
+    # Fuse BEFORE anything is captured. Graph capture is lazy -- the first pass of a given
+    # shape records it -- so fusing here means a graph records the FUSED kernels. Fusing
+    # after a capture would leave the replay running reference kernels while the eager
+    # fallback ran fused ones: two paths through the same engine doing different arithmetic,
+    # disagreeing by ~1.2e-3 depending only on whether a shape happened to be graphed. That
+    # is unreproducible-answer territory, so the order is not a style choice.
     if fuse_enabled() if fuse_layers is None else fuse_layers:
         fuse_torso(engine.model.torso)
     return engine
+
