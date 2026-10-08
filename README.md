@@ -1,10 +1,30 @@
 # strands-decider-triton
 
-Production hosting for **`strands-decider-2B-hobson-v21`** — a Triton Inference Server
-backend on an AWS SageMaker real-time endpoint.
+**An experiment in cheap decider hosting.** A Triton Inference Server backend for
+**`strands-decider-2B-hobson-v21`**, deployed to an AWS SageMaker real-time endpoint.
 
 Send a document and a set of typed questions; get back calibrated probabilities. No text
 generation, no decode loop, no prompt parsing on the way out.
+
+> [!WARNING]
+> **Experimental. Not a supported product, and not production-hardened.**
+>
+> This was built to answer a question — can a decider model be served cheaply on one GPU,
+> and where does the cost actually go? — and it is published so other people can poke at
+> the answer, not because it is ready to carry your traffic.
+>
+> **What is real:** it works, and every number in this README was *measured* on a live
+> endpoint rather than estimated, including a correctness gate of zero decision mismatches
+> against the model's published reference values.
+>
+> **What is not:** no SLA, no support, no security review, and no load testing beyond what
+> `tools/` does. It has run on exactly one instance type (`ml.g6.xlarge`, one L4). Several
+> tuning levers are explicitly untested — `instance_group count: 2` among them. It is a
+> carve-out from a larger private tree, so some cited paths are not here (see
+> [What this repo is *not*](#what-this-repo-is-not)). Read
+> [Known limits](#known-limits) before relying on any of it.
+>
+> Apache-2.0, so experiment freely. If you find it wrong, an issue or a PR is welcome.
 
 ```
 POST /invocations

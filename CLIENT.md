@@ -3,6 +3,19 @@
 Everything another project needs to call `strands-decider-2B-hobson-v21` on the live
 SageMaker endpoint. Verified against the running endpoint on 2026-10-08.
 
+> [!WARNING]
+> **This is an experimental endpoint. Do not build anything you care about on top of it.**
+>
+> It is one `ml.g6.xlarge` instance with no SLA, no support and no uptime commitment, run
+> for experimentation. **It may be shut down at any time, without notice** — GPU hosting
+> costs ~$27/day whether anyone calls it or not, so it will not stay up indefinitely. Make
+> your client fail clearly rather than hang if it disappears (see
+> [§7, Checking it's alive](#7-checking-its-alive)).
+>
+> The *contract* below is stable and worth coding against — it is the same JSON the
+> non-Triton server speaks. The *deployment* is not. If you need something durable, deploy
+> your own from this repo rather than depending on this instance.
+
 > **There is no plain URL you can `curl`.** This is a SageMaker real-time endpoint: every
 > request must be SigV4-signed with AWS credentials that hold `sagemaker:InvokeEndpoint`.
 > Use an AWS SDK (`boto3`, `@aws-sdk/client-sagemaker-runtime`, …) and give it the

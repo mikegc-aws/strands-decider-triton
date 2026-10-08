@@ -418,7 +418,7 @@ about **$0.022 per 1,000 tickets**, with a 7-question ticket at **67 ms** server
 
 | use | because |
 | --- | --- |
-| **this deployable** for production traffic on SageMaker | many callers, concurrent tickets — the batcher has something to batch, and the per-pass floor gets spread across it |
+| **this deployable** for concurrent traffic on SageMaker | many callers, overlapping tickets — the batcher has something to batch, and the per-pass floor gets spread across it. Experimental: see the warning at the top of [README.md](README.md) before putting anything you care about through it |
 | **the basic server** for local development, a laptop, MPS or CPU, CI, or a single-caller batch job | no Triton, no image build, no AWS; at concurrency 1 the two are within a few ms of each other, because with one request in flight there is nothing to coalesce |
 
 The second row is the honest caveat: **at concurrency 1 this deployment buys you almost
