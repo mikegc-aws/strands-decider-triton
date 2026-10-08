@@ -411,11 +411,26 @@ def delete_all(sm, region: str, endpoint: str, config: str, model: str, variant:
     except ClientError as exc:
         print(f"[config] list failed: {exc.response['Error']['Code']} (ignoring)")
 
+    # Models are swept by prefix for the same reason configs are: once --env is in the
+    # fingerprint, one endpoint name can own several `<name>-model-<hash>` models (one per
+    # accelerator combination measured on it). Deleting only the bare `<name>-model` would
+    # leave the rest behind -- they cost nothing to hold, but "delete every resource you
+    # created" has to actually be true.
+    deleted_models = 0
     try:
-        sm.delete_model(ModelName=model)
-        print("[model] deleted")
+        found = sm.list_models(NameContains=model.rsplit("-model", 1)[0] + "-model",
+                               MaxResults=100)
+        for item in found.get("Models", []):
+            try:
+                sm.delete_model(ModelName=item["ModelName"])
+                print(f"[model] deleted {item['ModelName']}")
+                deleted_models += 1
+            except ClientError as exc:
+                print(f"[model] {exc.response['Error']['Code']} (ignoring)")
     except ClientError as exc:
-        print(f"[model] {exc.response['Error']['Code']} (ignoring)")
+        print(f"[model] list failed: {exc.response['Error']['Code']} (ignoring)")
+    if not deleted_models:
+        print("[model] nothing to delete")
 
 
 def main() -> int:
@@ -436,14 +451,25 @@ def main() -> int:
                          "serve, so scale-out must be requested early")
     ap.add_argument("--engine", default="merged", choices=["merged", "hf"],
                     help="which forward pass the Triton backend builds")
+    ap.add_argument("--env", action="append", default=[], metavar="KEY=VALUE",
+                    help="extra container environment, repeatable. The opt-in accelerators "
+                         "live here: --env SD_CUDA_GRAPHS=1 --env SD_FUSE_LAYERS=1. Both "
+                         "override the matching `parameters` entry in config.pbtxt without "
+                         "rebuilding the model repository")
     ap.add_argument("--replace", action="store_true")
     ap.add_argument("--no-wait", action="store_true")
     ap.add_argument("--delete", action="store_true")
     args = ap.parse_args()
 
     sm = boto3.client("sagemaker", region_name=args.region)
-    model_name = f"{args.name}-model"
     endpoint_name = args.name
+
+    extra_env = {}
+    for item in args.env:
+        if "=" not in item:
+            ap.error(f"--env wants KEY=VALUE, got {item!r}")
+        key, value = item.split("=", 1)
+        extra_env[key.strip()] = value.strip()
 
     # The endpoint config name carries a hash of what it configures, so changing the
     # image (or instance type, or env) produces a NEW name.
@@ -460,10 +486,29 @@ def main() -> int:
     #
     # Old configs are left behind deliberately: they cost nothing, and keeping them means
     # a rollback is `--image <previous>`, which resolves to a config that already exists.
+    # `extra_env` IS part of the fingerprint, and leaving it out was a live bug the moment
+    # anything but --engine could reach the container environment. The comment above says
+    # "changing the image (or instance type, or env) produces a NEW name"; that was true only
+    # because env was derived entirely from --engine, which is hashed. It is not true of
+    # --env, and the failure is silent in BOTH directions:
+    #
+    #   * the config name would not move, so UpdateEndpoint refuses the config it already
+    #     serves and the deploy reports success having changed nothing -- measured once
+    #     already with --image, which is why this hash exists at all;
+    #   * the environment lives on the MODEL, not the config, and `ensure_model` reuses a
+    #     model by name. So an A/B of SD_CUDA_GRAPHS=0 against 1 would quietly re-measure
+    #     whichever variant was deployed first, and the numbers would look like "graphs do
+    #     nothing" rather than like a broken harness.
+    #
+    # Hence the model name carries the hash too whenever --env is given. It stays
+    # `<name>-model` when it is not, so existing deployments and the README's commands are
+    # unaffected.
     cfg_fingerprint = hashlib.sha256(
-        json.dumps([args.image, args.instance_type, args.variant, args.engine],
-                   sort_keys=True).encode()).hexdigest()[:10]
+        json.dumps([args.image, args.instance_type, args.variant, args.engine,
+                    sorted(extra_env.items())], sort_keys=True).encode()).hexdigest()[:10]
     config_name = f"{args.name}-config-{cfg_fingerprint}"
+    model_name = (f"{args.name}-model-{cfg_fingerprint}" if extra_env
+                  else f"{args.name}-model")
 
     if args.delete:
         delete_all(sm, args.region, endpoint_name, config_name, model_name, args.variant)
@@ -496,6 +541,10 @@ def main() -> int:
         "SD_ENGINE": args.engine,
         "SD_PREFIX_CACHE": "1",
     }
+    # Last, so --env can override the defaults above rather than being silently ignored.
+    env.update(extra_env)
+    if extra_env:
+        print(f"[env] extra container environment: {extra_env}")
 
     ensure_model(sm, model_name, args.image, role, env, args.replace)
     ensure_endpoint_config(sm, config_name, model_name, args.instance_type,
