@@ -93,8 +93,9 @@ instance_group [
     # the weights, so raise this with memory in mind: count * (weights + activations).
     #
     # Starts at 1. With dynamic batching doing the coalescing, a second instance helps
-    # only once one instance cannot saturate the GPU -- and that is a measurement
-    # (Phase 6), not a guess.
+    # only once one instance cannot saturate the GPU -- and that is a measurement, not a
+    # guess. Still unmeasured, and the cheapest untried lever; see README.md,
+    # "Known limits".
     count: 1
     kind: KIND_GPU
   }

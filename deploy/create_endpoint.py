@@ -10,11 +10,16 @@ are what the SDK calls anyway, so the scaffolding does not rot.
 Everything here is idempotent-ish: existing models and endpoint configs are reused unless
 `--replace` is given, and an existing endpoint is updated rather than recreated.
 
-    deploy/create_endpoint.py --image <acct>.dkr.ecr.us-west-2.amazonaws.com/strands-decider-serving:v21-triton
+    deploy/create_endpoint.py --image <acct>.dkr.ecr.us-west-2.amazonaws.com/strands-decider-serving:v23-triton-onepass
     deploy/create_endpoint.py --delete
 
-Nothing here was executed against a live account: this creates billable resources, and the
-brief was scaffold-only. Treat the first run as untested.
+This HAS been run against a live account and does work: it built the `strands-decider-g6`
+endpoint on `ml.g6.xlarge`, which reached `InService` and served traffic. Two things learned
+by doing it, both already fixed below: the endpoint config name must hash its contents or a
+new image silently never deploys (see `cfg_fingerprint`), and `ensure_endpoint` has to tell
+the three endpoint states apart because SageMaker rejects two of them with the same error
+code. It creates billable resources -- ~$27/day for one `ml.g6.xlarge`, charged whether the
+endpoint is used or not -- so pair every run with `--delete` when you are finished.
 """
 
 from __future__ import annotations
@@ -198,9 +203,13 @@ def configure_autoscaling(region: str, endpoint: str, variant: str,
     `SageMakerVariantInvocationsPerInstance` rather than GPUUtilization: the model's
     latency is dominated by prefill, so utilisation sits high even when the queue is short,
     which makes it a poor scaling signal here. Invocations-per-instance maps directly onto
-    the thing with a known ceiling, so set `target` from the measured throughput (Phase 6)
-    rather than guessing -- every throughput figure in this repo's history is currently
-    unverified, which is exactly why there is no clever default here.
+    the thing with a known ceiling.
+
+    `target` is per instance per MINUTE, and the measured ceiling is ~14 tickets/s, i.e.
+    ~840/minute. ~250 is about 30% of that and is the recommended operating point: a new
+    instance needs ~12 minutes to serve traffic, so scale-out has to be requested long
+    before the current instance is in trouble. 600 (~70%) was deployed first and is too
+    late -- see README.md, "Deploy".
     """
     aas = boto3.client("application-autoscaling", region_name=region)
     resource_id = f"endpoint/{endpoint}/variant/{variant}"
@@ -286,9 +295,10 @@ def main() -> int:
     ap.add_argument("--min-capacity", type=int, default=DEFAULT_MIN_CAPACITY)
     ap.add_argument("--max-capacity", type=int, default=DEFAULT_MAX_CAPACITY)
     ap.add_argument("--target-invocations", type=float, default=0.0,
-                    help="invocations per instance per minute to hold; 0 disables "
-                         "autoscaling, which is the default because this repo has no "
-                         "verified throughput number to derive it from yet")
+                    help="invocations per instance per MINUTE to hold; 0 disables "
+                         "autoscaling. The measured ceiling is ~840/min, so ~250 (~30%%) "
+                         "is the recommended target -- a new instance needs ~12 min to "
+                         "serve, so scale-out must be requested early")
     ap.add_argument("--engine", default="merged", choices=["merged", "hf"],
                     help="which forward pass the Triton backend builds")
     ap.add_argument("--replace", action="store_true")
@@ -371,8 +381,8 @@ def main() -> int:
                               args.min_capacity, args.max_capacity,
                               args.target_invocations)
     else:
-        print("[autoscale] skipped: pass --target-invocations once Phase 6 has a "
-              "measured per-instance throughput to derive it from")
+        print("[autoscale] skipped: no --target-invocations given. The measured ceiling "
+              "is ~840 invocations/instance/minute, so ~250 is a sensible target")
 
     print(json.dumps({"endpoint": endpoint_name, "status": status,
                       "invoke": f"aws sagemaker-runtime invoke-endpoint "
