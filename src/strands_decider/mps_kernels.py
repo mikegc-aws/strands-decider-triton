@@ -41,6 +41,18 @@ an ill-conditioned case of that shape.)
 with the two solves replaced by the inverse and the code restructured around it.
 `install()` swaps it in for MPS tensors only; other devices, and any build where a real
 kernel (fla) is already bound, are left alone.
+
+**NOT exercised by the Triton/SageMaker deployable in this repository.** On CUDA, `fla`
+provides the real kernel and `install()` deliberately leaves everything alone, so this file
+is inert in the deployed image even though `infer.py` imports it (function-locally, at
+`infer.py`'s device setup). It is carried rather than deleted for two reasons: it is what
+makes the laptop/MPS path that ARCHITECTURE.md §7 recommends usable, and the
+`_assert_fla_on_gpu` guard in the Triton backend exists precisely because a CUDA box can
+silently fall back to a reference chunk rule -- so the difference between the two
+implementations is operationally relevant even here. Note the test named above,
+`tests/test_mps_kernels.py`, is one of the suites that stayed in the private tree and is
+NOT in this repository (README.md, "What this repo is *not*"); the ill-conditioned case it
+describes is therefore an uncovered regression risk if anyone edits this file.
 """
 
 from __future__ import annotations

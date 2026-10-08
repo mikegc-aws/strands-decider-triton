@@ -15,6 +15,16 @@ forward after a cached prefix builds positions from the full prefix+suffix mask,
 reads a `rope_deltas` left on the module by the previous request.
 
 Needs transformers >= 5.18 and Pillow (`pip install "strands-decider[vision]"`).
+
+**NOT exercised by the Triton/SageMaker deployable in this repository.** The image is
+CUDA and text-only, and `schema.py` makes a request carrying images a caller error rather
+than ignoring them. The one entry point that reaches this file is
+`strands_decider.server.create_app(..., vision=True)` -- the plain FastAPI server, which
+is kept for local development and for running without Triton (ARCHITECTURE.md, §7). It is
+carried rather than deleted because that server is a documented, supported way to run this
+model, and because the vision path would otherwise have to be rebuilt from scratch to
+answer the "can it do images?" question. There are no tests for it here; the suite that
+covered it stayed in the private tree (README.md, "What this repo is *not*").
 """
 
 from __future__ import annotations

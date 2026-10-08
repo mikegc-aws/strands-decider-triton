@@ -59,12 +59,74 @@ from botocore.exceptions import ClientError
 # values and keep whichever lands, not to fall back to g5. See README.md, "Deploy".
 DEFAULT_INSTANCE = "ml.g6.xlarge"
 
+# ---- going bigger: ml.g6e.xlarge, measured ---------------------------------------------
+#
+#   instance        GPU    GPU mem   bandwidth   vCPU   $/hr (us-west-2 HOSTING)
+#   ml.g6.xlarge    L4      22.9 GB   300 GB/s     4     1.1267  <- default; the README's
+#                                                                   numbers are all this
+#   ml.g6.2xlarge   L4      22.9 GB   300 GB/s     8     1.2220
+#   ml.g6e.xlarge   L40S    45.8 GB   864 GB/s     4     2.6054
+#   ml.g6e.2xlarge  L40S    45.8 GB   864 GB/s     8     2.8026
+#
+# ml.g6e.xlarge runs this image with NO rebuild -- the L40S is sm89 and Dockerfile.triton
+# already builds for "8.0;8.6;8.9" -- and it is a large win under load. Measured through
+# two live endpoints, same harness, same in-region load generator, 7 questions, distinct
+# tickets (`tools/bench_tickets.py --tickets distinct`):
+#
+#            concurrency 1          concurrency 32 (saturation)
+#            dec/s   server p50     dec/s   server p50   tickets/s
+#   g6  (L4)  63.4     102.5 ms      99.0     620 ms       14.15
+#   g6e (L40S) 66.1      95.7 ms     269.8     209 ms       38.55
+#            +4%       -7%          +173%     -66%         +172%
+#
+# READ THOSE TWO COLUMNS TOGETHER, because they look contradictory and are not. At
+# concurrency 1 the bigger card buys ~4%, because a single small pass is bound by the CPU
+# issuing ~5,676 kernel launches -- the ~45 ms floor, which the GPU cannot help with. Under
+# load the dynamic batcher fills each pass with up to 8 requests x 7 questions = 56 rows, so
+# the pass is carrying thousands of tokens and has crossed out of the floor regime into the
+# marginal one (tokens x cost-per-token), where it is bound by weight streaming and
+# arithmetic. There the L40S's 864 GB/s against the L4's 300 GB/s is 2.88x, and the measured
+# 2.7x tracks it almost exactly.
+#
+# So "this model is dispatch-bound" is true of ONE request and false of a saturated server,
+# and which one you are measuring decides the instance you should buy. The same fact explains
+# why `instance_group count: 2` lost on the L4 (see config.pbtxt): under load that card is
+# genuinely saturated, not merely busy, so a second process found no idle GPU to overlap into
+# and only took CPU from the first.
+#
+# Cost per unit of work therefore FAVOURS g6e at full load, despite 2.31x the hourly rate:
+#   g6  : 14.15 tickets/s -> ~50,900 tickets/hr  -> $0.0221 per 1,000 tickets
+#   g6e : 38.55 tickets/s -> ~138,800 tickets/hr -> $0.0188 per 1,000 tickets  (-15%)
+# It is worse value only if your traffic is thin enough that you never leave concurrency 1,
+# where you would be paying 2.31x for 4%.
+#
+# TWO CAVEATS, both honest limits of the measurement above:
+#  * The g6e row is a LOWER BOUND. Its server-side p50 is only 209 ms, i.e. the server was
+#    not deeply queued, while the implied end-to-end latency was far higher -- so the 4-vCPU
+#    load generator, not the endpoint, is what 269.8 decisions/s measures. The g6 row is a
+#    real ceiling (p50 620 ms is the server queueing). A fatter load generator would raise
+#    the g6e number and not the g6 one.
+#  * 1-2 requests out of ~770 errored in the g6e c=16 and c=32 cells. Not enough to move the
+#    throughput figure, and not diagnosed.
+#
+# Also note the prices above are the SageMaker HOSTING rates. The EC2 on-demand rate for
+# g6e.xlarge is ~$1.86/hr; quoting that one under-budgets an endpoint by about 40%.
+#
+# CHECK YOUR QUOTA FIRST, because it is per instance type and is the thing most likely to
+# bite. In the account this was built in: ml.g6.xlarge for endpoint usage = 4, but
+# ml.g6e.xlarge = 1 -- so on g6e.xlarge autoscaling has nowhere to go and the 2.7x has to be
+# enough on its own. `resolve_max_capacity` below reads the real quota rather than trusting
+# DEFAULT_MAX_CAPACITY.
+
 # A warm floor of 1, deliberately. Inference Components can scale a model to zero, but GPU
 # cold start here is the image pull plus weight load plus the Gated DeltaNet kernel compile
 # -- measured 78.8 s for a fresh 23.5 GB pull, and the Triton image is larger. The brief
 # called this out and it is why scale-to-zero is not the default.
 DEFAULT_MIN_CAPACITY = 1
-DEFAULT_MAX_CAPACITY = 4  # the ml.g6.xlarge endpoint-usage quota in this account (verified)
+# 4 is the ml.g6.xlarge endpoint-usage quota in the account this was built in. It is a
+# DEFAULT, not a fact about your account or about any other instance type -- see
+# `resolve_max_capacity`, which checks the real quota before autoscaling is configured.
+DEFAULT_MAX_CAPACITY = 4
 
 # `/ping` returns 503 for the whole pull + load + warm-up window, and SageMaker kills the
 # container if it does not pass before this expires. Generous on purpose.
@@ -194,6 +256,79 @@ def wait_in_service(sm, name: str, timeout: int = 2400) -> str:
             return status
         time.sleep(20)
     return "Timeout"
+
+
+def endpoint_usage_quota(region: str, instance_type: str) -> float | None:
+    """The account's `<instance type> for endpoint usage` quota, or None if it cannot be read.
+
+    Looked up rather than hard-coded, because the quota is **per instance type and they are
+    not the same number**. Measured in the account this was built in:
+
+        ml.g6.xlarge   for endpoint usage -> 4
+        ml.g6e.xlarge  for endpoint usage -> 1
+
+    So the `DEFAULT_MAX_CAPACITY = 4` that is right for g6.xlarge is four times the real
+    ceiling on g6e.xlarge. That mismatch is worth an API call because of HOW it fails:
+    `application-autoscaling` happily accepts `MaxCapacity=4` -- it does not validate
+    against the SageMaker quota -- and the endpoint then scales out to 2, gets
+    `ResourceLimitExceeded` from SageMaker, and records it in the *scaling activity* log
+    rather than anywhere a deploy script or an operator would look. The endpoint stays at 1
+    instance, under load, silently, which is precisely the situation autoscaling was added
+    to prevent.
+
+    Service Quotas offers no name filter, so this pages the sagemaker service (~25 pages in
+    us-west-2) and stops at the first match. A missing `servicequotas:ListServiceQuotas`
+    permission returns None rather than raising: not being able to *check* the ceiling is
+    not a reason to refuse to deploy.
+    """
+    want = f"{instance_type} for endpoint usage"
+    try:
+        sq = boto3.client("service-quotas", region_name=region)
+        paginator = sq.get_paginator("list_service_quotas")
+        for page in paginator.paginate(ServiceCode="sagemaker"):
+            for quota in page.get("Quotas", []):
+                if quota["QuotaName"] == want:
+                    return float(quota["Value"])
+    except ClientError as exc:
+        print(f"[quota] could not read quotas ({exc.response['Error']['Code']}); "
+              "not checking the autoscaling ceiling")
+        return None
+    except Exception as exc:  # botocore model/endpoint differences across partitions
+        print(f"[quota] quota lookup failed ({type(exc).__name__}); not checking")
+        return None
+    print(f"[quota] no quota named {want!r} found")
+    return None
+
+
+def resolve_max_capacity(region: str, instance_type: str, requested: int) -> int:
+    """Clamp the autoscaling maximum to what the account can actually place.
+
+    Clamped rather than refused: a max of 1 is a legitimate (if un-scalable) deployment,
+    and the operator gets told plainly which it is. The alternative -- trusting `requested`
+    -- is the silent scale-out failure described in `endpoint_usage_quota`.
+    """
+    quota = endpoint_usage_quota(region, instance_type)
+    if quota is None:
+        return requested
+    allowed = int(quota)
+    if allowed <= 0:
+        raise SystemExit(
+            f"the {instance_type} endpoint-usage quota in this account is 0, so this "
+            "endpoint cannot be placed at all. Request an increase for "
+            f"'{instance_type} for endpoint usage' in Service Quotas, or pick another "
+            "instance type.")
+    if requested > allowed:
+        print(f"[quota] {instance_type} endpoint-usage quota is {allowed}; clamping "
+              f"--max-capacity from {requested} to {allowed}")
+        if allowed == 1:
+            print("[quota] NOTE: a maximum of 1 means autoscaling cannot add an instance. "
+                  "The target-tracking policy is still applied (it is harmless and becomes "
+                  "useful the moment the quota is raised), but this endpoint will absorb a "
+                  "spike as queueing, not as capacity.")
+        return allowed
+    print(f"[quota] {instance_type} endpoint-usage quota is {allowed}; "
+          f"--max-capacity {requested} fits")
+    return requested
 
 
 def configure_autoscaling(region: str, endpoint: str, variant: str,
@@ -377,8 +512,10 @@ def main() -> int:
         return 1
 
     if args.target_invocations > 0:
+        max_capacity = resolve_max_capacity(args.region, args.instance_type,
+                                            args.max_capacity)
         configure_autoscaling(args.region, endpoint_name, args.variant,
-                              args.min_capacity, args.max_capacity,
+                              args.min_capacity, max_capacity,
                               args.target_invocations)
     else:
         print("[autoscale] skipped: no --target-invocations given. The measured ceiling "

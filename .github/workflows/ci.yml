@@ -105,14 +105,22 @@ jobs:
           done
 
       - name: No credentials or account identifiers committed
-        # Cheap backstop, not a substitute for secret scanning. 763104351884 is AWS's own
-        # public Deep Learning Container registry and has to be literal, so it is allowed.
+        # Cheap backstop, not a substitute for secret scanning. Two literals are allowed,
+        # both of which are public by construction rather than "probably fine":
+        #   763104351884 is AWS's own public Deep Learning Container registry, and the
+        #                image URI has to be literal for the build to work.
+        #   111122223333 is the account id AWS reserves for its own documentation examples.
+        #                tests/test_deploy.py uses it to assert that the execution role's
+        #                trust policy pins aws:SourceAccount -- that test needs a
+        #                realistically shaped id, and inventing a 12-digit number that
+        #                might belong to somebody would be worse than using the reserved one.
         run: |
           python - <<'PY'
           import pathlib
           import re
 
-          ALLOWED_ACCOUNTS = {"763104351884"}      # AWS public DLC registry
+          ALLOWED_ACCOUNTS = {"763104351884",      # AWS public DLC registry
+                              "111122223333"}      # AWS's reserved docs example account
           PATTERNS = {
               "aws access key": re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"),
               "hugging face token": re.compile(r"\bhf_[A-Za-z0-9]{30,}\b"),

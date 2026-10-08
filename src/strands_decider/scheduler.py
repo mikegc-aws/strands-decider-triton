@@ -111,17 +111,26 @@ class Scheduler:
         self._stopping = threading.Event()
         self._ready = threading.Event()
         self._closed = False
-        # Counters are plain ints written only by the model thread and read by /health.
-        # A torn read would misreport a statistic, never an answer, so they are lock-free.
+        # Counters are plain ints read by /health. They are written from two sides:
+        # `served`/`failed`/`passes`/`refused_timeout` by the model thread(s), and
+        # `refused_full` by whichever CALLER thread found the queue full in `submit`.
         self.served = 0
         self.failed = 0
         self.refused_full = 0
         self.refused_timeout = 0
         self.passes = 0
         self.warmup_seconds: float | None = None
-        # With more than one worker the counters above have concurrent writers, and
-        # `n += 1` is a load-add-store that can lose an increment. A lock costs ~100 ns
-        # against a 50 ms request, so take it rather than under-report.
+        # Every increment takes this lock, because `n += 1` is a load-add-store that can
+        # lose an increment under concurrent writers. A lock costs ~100 ns against a 50 ms
+        # request, so take it rather than under-report.
+        #
+        # `refused_full` is the one that most needs it, which is why it was worth fixing:
+        # it is incremented on the producer side, so its writers are the server's request
+        # threads rather than the bounded set of model threads -- and it is only ever
+        # non-zero when the queue is full, i.e. when the largest number of those threads
+        # are hitting `queue.Full` at once. Left unlocked it under-counted exactly the
+        # metric you would use to decide whether `max_queue` is too small, precisely when
+        # that decision matters.
         self._counter_lock = threading.Lock()
         self._prev_switch = sys.getswitchinterval()
         sys.setswitchinterval(self.cfg.switch_interval_s)
@@ -154,7 +163,8 @@ class Scheduler:
         try:
             self._q.put_nowait(item)
         except queue.Full:
-            self.refused_full += 1
+            with self._counter_lock:
+                self.refused_full += 1
             raise Overloaded(
                 f"{self.cfg.max_queue} requests are already queued; retry in "
                 f"{self.cfg.retry_after_s}s"

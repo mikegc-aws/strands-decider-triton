@@ -317,6 +317,17 @@ class TritonPythonModel:
                     f"[decider] batched evaluate failed, falling back to per-request: "
                     f"{exc}\n{traceback.format_exc()}")
 
+        # ---- the PER-REQUEST FALLBACK path. See "Two paths through execute()" at the top
+        # of this module: it serves `SD_ENGINE=hf` (a plain `SystemOneEngine`, which has no
+        # `evaluate_many`), and it catches a batched path that raised.
+        #
+        # Note what makes it a fallback, because it is not an `else`: this loop ALWAYS runs,
+        # and the `continue` below is the only thing that makes it a no-op after a
+        # successful batched pass. That shape is deliberate -- it means a batched call that
+        # answered only *some* of the batch still has the rest picked up here, rather than
+        # the gap being filled by the "no response produced" guard at the end. The cost of
+        # the shape is that removing the `continue` as "dead" would silently re-run every
+        # request a second time, at roughly 45 ms a pass.
         for _state, idxs in self._group_by_state(parsed).items():
             if all(responses[i] is not None for i in idxs):
                 continue

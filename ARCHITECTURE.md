@@ -449,10 +449,63 @@ assemble a big batch and then split it anyway. That is measurable: raising
 | `max_batch_size` | `config.pbtxt` | 8 | measured; see above |
 | `max_queue_delay_microseconds` | `config.pbtxt` | 2 ms | pure added latency for a request arriving into an empty queue, so keep it small relative to ~67 ms of work. A copy-pasted 100 ms would dominate the request |
 | `max_queue_size` | `config.pbtxt` | 256, then REJECT | bounded shedding beats unbounded latency |
-| `instance_group count` | `config.pbtxt` | 1 | the model is ~5 GB on a 24 GB card, so several fit; raising it overlaps one batch's CPU work with another's GPU work. **Untested — the cheapest untried lever** |
+| `instance_group count` | `config.pbtxt` | 1 | **measured; 2 and 3 are worse** (101.5 → 91.4 → 79.8 decisions/s). Memory is not the limit — 4.7/9.2/13.7 GB all fit. See below |
 | `max_rows` | `BatchedSystemOneEngine` | 128 | activation memory for the whole in-flight batch |
 | `DUP_TOKEN_BUDGET` | `BatchedSystemOneEngine` | 480 | the one-pass/two-pass threshold, in duplicated state tokens |
 | `SD_ENGINE` | container env | `merged` | `merged` folds the LoRA; `hf` is for A/B only and needs an image built with `peft` |
+
+### Why more model copies made it slower
+
+`instance_group count` was the obvious next lever and the interesting thing is *why* it
+failed, because the reason generalises. Measured on `ml.g6.xlarge`, 7 questions, distinct
+tickets, at c=32:
+
+```
+count   decisions/s   p50       GPU util (mean/median)   GPU memory
+  1        101.5      611 ms       83% / 85%               4.7 GB
+  2         91.4     1334 ms       89% / 100%              9.2 GB
+  3         79.8     1893 ms       86% / 97%              13.7 GB
+```
+
+The second instance does exactly what it was supposed to do — it keeps the card busier,
+median utilisation 85% → 100% — and the endpoint gets **slower**. Both halves of that are
+the same fact: **this model's bottleneck is the CPU issuing kernels, not the GPU running
+them.** The ~45 ms floor is ~5,676 launches issued single-threaded per stub process, and
+`ml.g6.xlarge` has 4 vCPU in total. A second dispatcher therefore does not find an idle
+core; it takes one from the first, and the card's extra "utilisation" is two processes
+interleaving small kernels rather than one process issuing them promptly.
+
+Underneath that is a batching mistake worth seeing clearly. Each instance gets **its own
+dynamic batcher**, and Triton spreads arrivals across them. So `count: 2` turns one queue
+forming batches of 8 into two queues forming batches of ~4 — and `max_batch_size: 8` was
+chosen precisely so that 8 × 7 = 56 rows fit `max_rows` (128) in a single pass pair. Two
+batches of 4 are two pass pairs over the same tokens, so the 45 ms floor is paid twice.
+This is the `max_batch_size: 32` failure again — batch geometry that no longer matches
+`max_rows` — approached from the other side, and it is the second time the same rule has
+decided a tuning question:
+
+> **`count × max_batch_size × typical questions` should land at or just under `max_rows`.**
+
+There is a second, sharper reading of the same data, and it only became visible after
+`ml.g6e.xlarge` was measured (see [README.md](README.md), "Picking an instance"): replacing
+the L4 with an L40S — 2.88× the memory bandwidth, nothing else changed — gave **2.7× the
+decisions/s on this identical configuration**. A card that goes 2.7× faster when you swap it
+*was* the bottleneck. So under load the L4 is **genuinely saturated, not merely busy**, and
+a second process could not have found idle GPU time to overlap into no matter how its CPU
+was scheduled.
+
+That reconciles the two results and corrects the obvious over-generalisation:
+
+> **"Dispatch-bound" is a property of one small pass, not of a loaded server.** At
+> concurrency 1 the ~45 ms CPU floor dominates and the GPU is nearly irrelevant (an L40S
+> buys 4%). Once the batcher has filled a pass with 56 rows, the pass has crossed into the
+> marginal regime and the GPU's bandwidth is the limit (an L40S buys 2.7×).
+
+So the levers divide by regime. To improve **single-request latency**, cut kernel launches
+per pass — CUDA graphs, fused kernels — because that floor is CPU and no card removes it. To
+improve **throughput at saturation**, buy memory bandwidth. Neither is helped by more copies
+of the model, and the utilisation column is the thing that would mislead you: `count: 2`
+raised median utilisation to 100% while doing 10% less work.
 
 ---
 
@@ -460,10 +513,12 @@ assemble a big batch and then split it anyway. That is measurable: raising
 
 Stated plainly so you do not discover it in production:
 
-- **Throughput is dispatch-bound, not compute-bound.** The ~45 ms floor is CPU kernel-launch
-  overhead, and prefill runs at ~34% of the card's peak. Cutting that floor is the largest
-  remaining win. Plain CUDA-graph capture was measured on this torso and **does not work** —
-  the shapes that go fast return wrong values.
+- **Latency is dispatch-bound; throughput at saturation is bandwidth-bound.** The ~45 ms
+  floor is CPU kernel-launch overhead and is what one small pass pays; cutting it is the
+  largest remaining win *for latency*. Plain CUDA-graph capture was measured on this torso
+  and **does not work** — the shapes that go fast return wrong values. A loaded server is a
+  different regime: see §8, "Why more model copies made it slower". Do not quote the 45 ms
+  floor as a throughput ceiling.
 - **A single question costs almost as much as three.** Same reason: you are paying for the
   pass, not the work.
 - **Under load, latency becomes queueing.** At 32 requests in flight a 7-question ticket sits

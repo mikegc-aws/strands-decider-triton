@@ -18,9 +18,9 @@ generation, no decode loop, no prompt parsing on the way out.
 > against the model's published reference values.
 >
 > **What is not:** no SLA, no support, no security review, and no load testing beyond what
-> `tools/` does. It has run on exactly one instance type (`ml.g6.xlarge`, one L4). Several
-> tuning levers are explicitly untested — `instance_group count: 2` among them. It is a
-> carve-out from a larger private tree, so some cited paths are not here (see
+> `tools/` does. It has run on two instance types — `ml.g6.xlarge` (one L4) and
+> `ml.g6e.xlarge` (one L40S) — and most numbers here are the L4. It is a carve-out from a
+> larger private tree, so some cited paths are not here (see
 > [What this repo is *not*](#what-this-repo-is-not)). Read
 > [Known limits](#known-limits) before relying on any of it.
 >
@@ -120,6 +120,7 @@ model_repository/decider/
   config.pbtxt            dynamic batching, instance group, warm-up policy
   1/model.py              the Triton python backend
 deploy/
+  up.py                   ONE COMMAND: role -> image -> endpoint -> a real invocation
   Dockerfile.triton       two-stage: fold the LoRA on CPU, then the runtime image
   build_on_box.sh         in-region amd64 build + push to ECR, via SSM
   create_endpoint.py      model, endpoint config, endpoint, autoscaling (boto3)
@@ -150,9 +151,19 @@ repository** and that is expected, not a broken link:
 Two consequences worth knowing before you read the source. `src/strands_decider/` is
 importable but has **no CLI**, so where a docstring says `strands-decider serve <ckpt>`,
 the equivalent here is `strands_decider.server.create_app(...)` or `serve(...)`. And
-`mlx_engine.py` / `vision.py` / `mps_kernels.py` are carried along because `infer.py`
-imports into them, but neither the MLX nor the vision path is exercised by this
-deployable — the Triton image is CUDA and text-only.
+`mlx_engine.py` / `vision.py` / `mps_kernels.py` are carried along but **not exercised by
+this deployable** — the Triton image is CUDA and text-only. Each is reached by exactly one
+entry point, in all three cases through a function-local import, so nothing on the CUDA
+path imports them at all:
+
+| file | reached only by | why it is kept |
+| --- | --- | --- |
+| `mlx_engine.py` | `infer.load_mlx_engine` (`--device mlx`) | the Apple-silicon half of the "use the plain server on a laptop" recommendation in [ARCHITECTURE.md](ARCHITECTURE.md) §7 |
+| `mps_kernels.py` | `infer.py`'s device setup; `install()` is a no-op once `fla` is bound, so it is inert on CUDA | same, plus it is the reference implementation the Triton backend's `_assert_fla_on_gpu` guard exists to keep you off |
+| `vision.py` | `server.create_app(..., vision=True)` | answers "can it do images?" without rebuilding the path; `schema.py` refuses images on a text-only engine rather than ignoring them |
+
+None of the three has tests here — those suites stayed in the private tree, which is an
+uncovered regression risk if you edit them.
 
 ## Running it
 
@@ -166,7 +177,41 @@ python -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 Use the venv. The system interpreter usually lacks `fastapi`/`torch`, and the failure
 looks like broken tests rather than a missing dependency.
 
-### 2. Build the image
+### 2. One command to a working endpoint
+
+If an image already exists in your account's ECR — which is the usual case after the first
+build — this is the whole path from a fresh clone plus credentials:
+
+```bash
+deploy/up.py --name my-decider            # creates the role, the endpoint, and verifies it
+deploy/up.py --name my-decider --down     # deletes all of it
+```
+
+`up.py` orchestrates the two scripts below rather than replacing them. It creates a
+least-privilege execution role if you do not pass `--role` (ECR pull plus scoped
+CloudWatch Logs — *not* `AmazonSageMakerFullAccess`), waits for IAM to propagate, hands off
+to `create_endpoint.py`, and then **invokes the endpoint for real** and checks all three
+primitives came back. That last step is the point: `InService` only means `/ping` answered,
+and a wrong `SD_ENGINE` or an unreadable model repository produces an endpoint that is
+`InService` and fails every request.
+
+To build the image too, add `--build --box-id <instance>`:
+
+```bash
+deploy/up.py --name my-decider --build --box-id i-0123456789abcdef0 --tag v23-triton-onepass
+```
+
+**`--build` needs a GPU box you already have**, and that is the one genuine gap in the
+one-command story: this build cannot run on a laptop (see below), so `up.py` will not
+invent an instance for you. It does create the S3 build-context bucket, which
+`build_on_box.sh` needs and does not create itself.
+
+It creates billable resources — ~$1.13/hr for `ml.g6.xlarge`, charged whether or not
+anything calls it — so `--down` is part of the workflow, not an afterthought. `--down`
+leaves the ECR image and the build bucket alone deliberately: they cost cents and are what
+make the next `up.py` take minutes instead of an hour.
+
+### 3. Build the image
 
 Build **in-region on an amd64 GPU host**, not on a laptop: the base image alone is 27.7 GB
 and the result is ~20.6 GB compressed.
@@ -186,7 +231,7 @@ SageMaker hosts carry NVIDIA drivers as old as `470.256.02`, below the minimum f
 current DLC. The build asserts its own dependency versions (`torch 2.7.1+cu126`,
 `triton >= 3.3`, `transformers >= 5.18`) and fails rather than shipping a mismatch.
 
-### 3. Deploy
+### 4. Deploy by hand
 
 ```bash
 deploy/create_endpoint.py \
@@ -227,7 +272,64 @@ Teardown: `deploy/create_endpoint.py --name strands-decider-g6 --delete`.
 whichever lands — a capacity failure takes ~31 minutes to surface, so running the ladder
 in parallel beats running it in series. Delete the losers.
 
-### 4. Calling it
+### Picking an instance: `ml.g6e.xlarge` is 2.7× under load
+
+| instance | GPU | GPU mem | bandwidth | vCPU | $/hr hosting, us-west-2 |
+| --- | --- | --- | --- | --- | --- |
+| **`ml.g6.xlarge`** | L4 | 22.9 GB | 300 GB/s | 4 | **1.1267** — the default; most numbers here |
+| `ml.g6.2xlarge` | L4 | 22.9 GB | 300 GB/s | 8 | 1.2220 |
+| `ml.g6e.xlarge` | L40S | 45.8 GB | 864 GB/s | 4 | 2.6054 |
+| `ml.g6e.2xlarge` | L40S | 45.8 GB | 864 GB/s | 8 | 2.8026 |
+
+**`ml.g6e.xlarge` needs no rebuild** — the L40S is sm89 and `deploy/Dockerfile.triton`
+already targets `8.0;8.6;8.9`. Measured through two live endpoints, same harness, same
+in-region load generator, 7 questions, distinct tickets:
+
+| | concurrency 1 | | concurrency 32 (saturation) | | |
+| --- | --- | --- | --- | --- | --- |
+| | decisions/s | server p50 | decisions/s | server p50 | tickets/s |
+| `g6` (L4) | 63.4 | 102.5 ms | 99.0 | 620 ms | 14.15 |
+| `g6e` (L40S) | 66.1 | 95.7 ms | **269.8** | **209 ms** | **38.55** |
+| | +4% | −7% | **+173%** | **−66%** | +172% |
+
+**Read those two halves together, because they look contradictory and are not.** At
+concurrency 1 the bigger card buys ~4%: a single small pass is bound by the CPU issuing
+~5,676 kernel launches, and no GPU can help with that. Under load the batcher fills each
+pass with up to 8 requests × 7 questions = 56 rows, so the pass carries thousands of tokens
+and has crossed out of the fixed-floor regime into the marginal one — where it is bound by
+weight streaming and arithmetic, and the L40S's 2.88× memory bandwidth shows up almost
+linearly as the measured 2.7×.
+
+So **"this model is dispatch-bound" is true of one request and false of a saturated
+server**, and which regime you care about picks the instance. The same fact explains why
+`instance_group count: 2` lost on the L4: under load that card is genuinely saturated, not
+merely busy, so a second process found no idle GPU to overlap into.
+
+Cost per unit of work therefore **favours `g6e` at full load**, despite 2.31× the hourly
+rate — ~$0.0188 per 1,000 tickets against ~$0.0221, about 15% cheaper. It is worse value
+only if your traffic never leaves concurrency 1, where you would pay 2.31× for 4%.
+
+Three things to know before you rely on this:
+
+- **The `g6e` row is a lower bound.** Its server-side p50 was only 209 ms — the server was
+  not deeply queued — so 269.8 decisions/s is what the 4-vCPU *load generator* could drive,
+  not the endpoint's ceiling. The `g6` row is a real ceiling (p50 620 ms is the server
+  queueing). A fatter load generator would raise one number and not the other. 1–2 requests
+  of ~770 also errored in the `g6e` c=16/32 cells, undiagnosed.
+- **Those are SageMaker *hosting* rates, not EC2 rates.** `g6e.xlarge` on EC2 on-demand is
+  ~$1.86/hr; as a SageMaker endpoint it is $2.6054/hr. The EC2 number under-budgets by ~40%.
+- **The endpoint-usage quota is per instance type and they differ.** In the account this was
+  built in, `ml.g6.xlarge for endpoint usage` is **4** but `ml.g6e.xlarge` is **1** — so on
+  `g6e.xlarge` autoscaling has nowhere to go and the 2.7× has to be enough by itself.
+  `create_endpoint.py` now reads the real quota and clamps, because `application-autoscaling`
+  accepts an impossible maximum without complaint and records the failed scale-out only in a
+  scaling activity log.
+
+And still **not `ml.g5`**: that fleet's host drivers (470.x, 535.x) are too old for any
+current Triton DLC. It was tried on both CUDA 12 and CUDA 13 and failed both times; the
+details are in `deploy/create_endpoint.py`.
+
+### 5. Calling it
 
 `/invocations` on the Triton DLC is a proxy to Triton's KServe v2 `infer`, so the body
 travels inside a tensor envelope. `shape` is `[1, 1]` because the model sets
@@ -260,6 +362,22 @@ requests batched alongside it.
 Run load tests **in-region**. From a laptop the round trip dominates and you measure the
 internet, not the model.
 
+> [!WARNING]
+> **Load-testing an endpoint that has autoscaling attached will scale it out, and you pay
+> for that for about half an hour.** Observed: a ~3-minute `bench_tickets.py` run against
+> `strands-decider-g6` (target 250 invocations/instance/minute, max 4) pushed the high alarm
+> into `ALARM` and set desired capacity to **3**. Because a new instance needs ~12 minutes
+> to serve, and `ScaleInCooldown` is 600 s, the endpoint then sits above its floor for
+> ~25–30 minutes after the load stops — roughly $1 of instances for a 3-minute test, and
+> it also means a *second* test started during that window is measuring 3 instances rather
+> than 1.
+>
+> Either point load tests at an endpoint with no scaling policy (which is what
+> `deploy/up.py --name <something-else>` gives you by default), or measure the container
+> directly with `--base http://localhost:8100`, which is what the `instance_group` table
+> above was done with. Check `CurrentInstanceCount` before trusting any throughput number
+> from a scaled endpoint.
+
 Two startup guards worth knowing about, because both failure modes are silent rather than
 loud:
 
@@ -277,19 +395,65 @@ loud:
 | `max_batch_size` | `config.pbtxt` | Requests coalesced per `execute()`. **8**, measured. Keep `max_batch_size × typical questions` at or just under `max_rows`; 32 was tried and is worse. |
 | `max_queue_delay_microseconds` | `config.pbtxt` | 2 ms. Pure added latency for a request arriving into an empty queue, so keep it small relative to the work. |
 | `max_queue_size` | `config.pbtxt` | 256, then reject. Bounded shedding beats unbounded latency — a load balancer can act on a refusal. |
-| `instance_group count` | `config.pbtxt` | 1. The model is ~5 GB on a 24 GB card so several fit; raising it overlaps one batch's CPU work with another's GPU work. Untested. |
+| `instance_group count` | `config.pbtxt` | **1**, measured. 2 and 3 both fit in memory and are both *worse* — 91.4 and 79.8 decisions/s against 101.5. See [below](#instance_group-count-measured-1-wins). |
 | `max_rows` | `BatchedSystemOneEngine` | 128 question rows per pass. Activation memory for the whole in-flight batch. |
 | `DUP_TOKEN_BUDGET` | `BatchedSystemOneEngine` | 480. Above this many duplicated state tokens, encoding the state once and forking the cache beats a single combined pass. |
 | `SD_ENGINE`, `SD_PREFIX_CACHE` | container env | `merged` folds the LoRA into the torso (no PEFT at runtime). Prefix caching on. |
 
+### `instance_group count`: measured, 1 wins
+
+This was the README's "cheapest untried lever". It is now tried, and it does not pay.
+`ml.g6.xlarge` (one L4, **4 vCPU**), 7 questions per ticket, distinct tickets,
+`tools/bench_tickets.py --tickets distinct`, server-side latency, each row at the
+concurrency where that setting peaks (c=32):
+
+| `count` | decisions/s | tickets/s | server p50 | server p95 | GPU util (mean / median) | GPU memory |
+| --- | --- | --- | --- | --- | --- | --- |
+| **1** | **101.5** | **14.5** | **611 ms** | **615 ms** | 83% / 85% | 4.7 GB |
+| 2 | 91.4 | 13.1 | 1,334 ms | 1,348 ms | 89% / 100% | 9.2 GB |
+| 3 | 79.8 | 11.4 | 1,893 ms | 2,819 ms | 86% / 97% | 13.7 GB |
+
+Zero errors in every cell, and `count: 1` reproduced the 101.5 decisions/s and 611 ms p50
+already recorded in [ARCHITECTURE.md](ARCHITECTURE.md) §8, which is what makes the other
+two rows comparable rather than merely adjacent.
+
+**Memory was never the constraint** — 4,474 MiB per stub process plus 250 MiB for
+`tritonserver`, so even 3 copies sit inside the L4's 22.9 GB with ~9 GB spare. The
+constraint is CPU and batch geometry:
+
+- **It halves the batch.** Triton gives each instance its own dynamic batcher and spreads
+  arrivals between them, so 2 instances each form batches of ~4 instead of 8.
+  `max_batch_size: 8` is tuned so 8 × 7 = 56 rows run as *one* pass pair; two batches of 4
+  are *two* pass pairs, paying the ~45 ms dispatch floor twice for the same work. It is the
+  same mistake as `max_batch_size: 32`, reached from the opposite direction.
+- **It splits 4 vCPU.** The 45 ms floor is CPU kernel-launch overhead (~5,676 launches per
+  pass), issued single-threaded per stub. A second dispatcher does not get a free core on a
+  4-vCPU box; it takes one from the first.
+
+The tell is in the utilisation column: `count: 2` runs the card at a *higher* median
+utilisation (100% against 85%) while delivering 10% *less* work. That is contention, not
+overlap — and it is why "GPU util is high" is not evidence that a GPU is the bottleneck on
+this model.
+
+**Revisit it only with more vCPU**, and only together with `max_batch_size`, so that
+`count × max_batch_size × questions` still lands at or just under `max_rows`.
+`ml.g6.2xlarge` (8 vCPU, same L4, ~8% more money) is the cheap place to retest.
+
 ## Known limits
 
-- **Throughput is dispatch-bound, not compute-bound.** One forward pass has a ~45 ms floor
-  on an L4 that is CPU kernel-launch overhead (~5,676 launches) against a 12.7 ms
-  weight-streaming floor, and prefill runs at ~34% of the card's peak. Cutting that floor
-  is the largest remaining serving win. Plain CUDA-graph capture was measured on this torso
-  and does not work — the shapes that go fast return wrong values.
-- **`instance_group count: 2` is untested** and is the cheapest untried lever.
+- **Latency is dispatch-bound; throughput at saturation is not.** One *small* forward pass
+  has a ~45 ms floor on an L4 that is CPU kernel-launch overhead (~5,676 launches) against a
+  12.7 ms weight-streaming floor, and that floor is what a single request pays — cutting it
+  is the largest remaining win for latency. Plain CUDA-graph capture was measured on this
+  torso and does not work: the shapes that go fast return wrong values. But once the batcher
+  has filled a pass with 56 rows the pass leaves that regime, and a **loaded** server is
+  bound by the card: an L40S with 2.88× the memory bandwidth delivers 2.7× the decisions/s
+  on the same configuration. An earlier version of this README claimed throughput was
+  dispatch-bound full stop; that was an over-generalisation from concurrency-1 profiling.
+- **`instance_group count: 2` is now measured and is worse** (91.4 decisions/s against
+  101.5, with p50 doubling). More GPU-side parallelism is not the lever on a 4-vCPU host —
+  see [above](#instance_group-count-measured-1-wins). The remaining levers all attack the
+  dispatch floor itself, or buy more vCPU to issue it with.
 - A single question costs almost as much as three, for the same reason: you are paying for
   the pass, not the work.
 - Text only. Images are rejected; the vision path needs a different torso.

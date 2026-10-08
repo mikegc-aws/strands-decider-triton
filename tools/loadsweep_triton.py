@@ -189,4 +189,10 @@ def main() -> int:
     return 0
 
 
-main()
+if __name__ == "__main__":
+    # The guard is not boilerplate here. Without it, `import loadsweep_triton` -- which is
+    # what a test collector, a `--help` wrapper or an editor's symbol indexer does -- starts
+    # a real 5-cell load sweep against localhost:8100 and blocks for minutes. Every other
+    # tool in this directory has the guard; this one did not, and importing it was a
+    # 5-minute benchmark.
+    raise SystemExit(main())

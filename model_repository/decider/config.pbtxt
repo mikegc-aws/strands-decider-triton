@@ -87,15 +87,53 @@ dynamic_batching {
 
 instance_group [
   {
-    # Model copies per GPU. The model is ~5 GB bf16 on a 24 GB L4, so several fit, and
-    # this is the "scale out with processes" that scheduler.py recommends but leaves to
-    # the operator. Each instance is a separate python stub process with its own copy of
-    # the weights, so raise this with memory in mind: count * (weights + activations).
+    # Model copies per GPU. Each instance is a separate python stub process with its own
+    # copy of the weights: MEASURED at 4,474 MiB per stub plus 250 MiB for tritonserver,
+    # so 1/2/3 instances occupy 4.7 / 9.2 / 13.7 GB of the L4's 22.9 GB. Memory is NOT the
+    # binding constraint -- all three fit with room to spare.
     #
-    # Starts at 1. With dynamic batching doing the coalescing, a second instance helps
-    # only once one instance cannot saturate the GPU -- and that is a measurement, not a
-    # guess. Still unmeasured, and the cheapest untried lever; see README.md,
-    # "Known limits".
+    # 1 is now MEASURED, and 2 and 3 are both WORSE. ml.g6.xlarge (one L4, 4 vCPU),
+    # 7 questions per ticket, distinct tickets, server-side latency, at the concurrency
+    # where each setting peaks (c=32):
+    #
+    #     count   decisions/s   p50       p95       GPU util (mean/median)
+    #       1         101.5     611 ms    615 ms      83% / 85%
+    #       2          91.4    1334 ms   1348 ms      89% / 100%
+    #       3          79.8    1893 ms   2819 ms      86% / 97%
+    #
+    # So the theory it was supposed to test -- that a second process lets one batch's CPU
+    # dispatch overlap another's GPU execution -- does not pay here, and the numbers say
+    # why. Note count=2 runs the card at a HIGHER utilisation (median 100% against 85%)
+    # while delivering 10% LESS work: the card is busier and achieving less, which is what
+    # contention looks like rather than overlap.
+    #
+    # Two mechanisms, and the first is the big one:
+    #
+    #  1. IT HALVES THE BATCH. Triton gives each instance its own dynamic batcher and
+    #     spreads arrivals between them, so with 2 instances each batcher sees about half
+    #     the arrival rate and forms batches of ~4 instead of 8. max_batch_size: 8 was
+    #     tuned so 8 requests x 7 questions = 56 rows run as ONE pass pair; two batches of
+    #     4 are two pass pairs, so the ~45 ms dispatch floor is paid twice for the same
+    #     work. This is the same failure as max_batch_size: 32 above -- batch geometry that
+    #     no longer matches max_rows -- reached from the opposite direction.
+    #  2. IT SPLITS 4 vCPU. The 45 ms floor is CPU kernel-launch overhead (~5,676 launches
+    #     per pass). Issuing those is single-threaded per stub, and ml.g6.xlarge has only
+    #     4 vCPU for every stub, tritonserver itself, and anything else on the box. A
+    #     second dispatcher does not get a free core; it takes one from the first.
+    #
+    # WHEN TO REVISIT THIS, because the result is hardware-specific rather than universal.
+    # The precondition for a second instance paying is that the card has GPU time going
+    # spare, and on the L4 under load it does NOT -- that is the same measurement as
+    # ml.g6e.xlarge (L40S, 2.88x the memory bandwidth) delivering 2.7x the decisions/s on
+    # this identical configuration, recorded in deploy/create_endpoint.py. A card that goes
+    # 2.7x faster when you replace it was the bottleneck; a second process could not have
+    # found idle time on it.
+    #
+    # So the place to retest count > 1 is a card with headroom left over -- an L40S, where
+    # the GPU is no longer the limit and the 4 vCPU may become it -- and ideally with more
+    # vCPU too (ml.g6e.2xlarge is 8 vCPU). Move it together with max_batch_size, so that
+    # count x max_batch_size x questions still lands at or just under max_rows; raising
+    # count alone is what produced the table above.
     count: 1
     kind: KIND_GPU
   }

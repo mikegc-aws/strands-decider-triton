@@ -19,6 +19,14 @@ fp32 on the CPU, over `evaluation/device_parity.py`'s 54 answers, no answer chan
 largest probability difference is 0.0138 here and 0.0051 on MPS. Most of the gap is the merge's
 rounding: MPS with the adapter merged the same way differs by 0.0105, and this engine in fp32 by
 0.0036.
+
+**NOT exercised by the Triton/SageMaker deployable in this repository**, which is CUDA-only.
+The one entry point that reaches this file is `strands_decider.infer.load_mlx_engine`
+(`--device mlx`), behind a function-local import, so nothing on the CUDA path imports mlx at
+all. It is carried rather than deleted because ARCHITECTURE.md §7 recommends the plain
+FastAPI server for "local development, a laptop, MPS or CPU" -- and on Apple silicon this
+file and `mps_kernels.py` ARE that recommendation. Delete them and the recommendation
+becomes false. There are no tests for it here; they stayed in the private tree.
 """
 
 from __future__ import annotations
