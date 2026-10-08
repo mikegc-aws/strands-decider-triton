@@ -12,10 +12,29 @@
 # reason, and this is what proves the sweep worked.
 #
 # Usage: triton_smoke.sh [IMAGE] [PORT]
+#
+# With no IMAGE, the ECR registry is resolved from the caller's own account rather than
+# hard-coded, so this script carries no account id. Override REPO/TAG/REGION, or pass a
+# full image URI as the first argument.
 
 set -uo pipefail
 
-IMAGE="${1:-680624154995.dkr.ecr.us-west-2.amazonaws.com/strands-decider-serving:v21-triton}"
+REGION="${REGION:-us-west-2}"
+REPO="${REPO:-strands-decider-serving}"
+TAG="${TAG:-v23-triton-onepass}"
+
+if [ -n "${1:-}" ]; then
+    IMAGE="$1"
+else
+    ACCOUNT="$(aws sts get-caller-identity --query Account --output text --region "$REGION" 2>/dev/null)"
+    if [ -z "$ACCOUNT" ] || [ "$ACCOUNT" = "None" ]; then
+        echo "could not resolve the AWS account id, and no IMAGE argument was given." >&2
+        echo "Either configure credentials or run: $0 <account>.dkr.ecr.<region>.amazonaws.com/$REPO:$TAG" >&2
+        exit 2
+    fi
+    IMAGE="${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com/${REPO}:${TAG}"
+fi
+
 PORT="${2:-8100}"
 NAME="sd-triton-smoke"
 CACHE="${TRITON_KERNEL_CACHE:-/opt/triton-cache}"

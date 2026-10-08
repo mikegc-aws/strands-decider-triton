@@ -16,6 +16,7 @@ __pycache__/
 ._*
 
 # Build/benchmark scratch. Results that matter are archived to
-# s3://hobson-v17-680624154995-us-west-2/results/serving/ and quoted in the docs.
+# s3://hobson-v17-<account>-<region>/results/serving/ (see deploy/build_on_box.sh, which
+# derives that bucket name) and quoted in the docs.
 *.log
 /tmp/

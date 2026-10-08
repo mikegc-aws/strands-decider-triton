@@ -16,11 +16,12 @@
 #   deploy/build_on_box.sh [TAG]
 #
 # Env:
-#   BOX_ID    instance to build on          (default i-0afe59ab85f8791ec)
+#   BOX_ID    instance to build on          (REQUIRED, no default)
 #   REGION    AWS region                    (default us-west-2)
 #   BUCKET    build-context bucket          (default hobson-v17-<acct>-<region>)
 #   REPO      ECR repository                (default strands-decider-serving)
-#   HF_TOKEN  passed as a BuildKit secret if set (never lands in a layer)
+#   HF_TOKEN  passed as a BuildKit secret if set (never lands in an image layer -- but it
+#             DOES land in SSM command history, see the warning below)
 #   TRITON_IMAGE  base image override, passed through as a --build-arg
 #
 # TRITON_IMAGE matters more than a normal override: the base image's CUDA major version
@@ -35,7 +36,24 @@ set -euo pipefail
 
 TAG="${1:-v21-triton}"
 REGION="${REGION:-us-west-2}"
-BOX_ID="${BOX_ID:-i-0afe59ab85f8791ec}"
+# Required rather than defaulted: a hard-coded instance id is one account's infrastructure
+# baked into a script, and a stale one sends the build at whatever now holds that id.
+BOX_ID="${BOX_ID:-}"
+if [ -z "$BOX_ID" ]; then
+    cat >&2 <<USAGE
+BOX_ID is required: the in-region amd64 GPU instance to build on.
+
+    BOX_ID=i-0123456789abcdef0 $0 ${TAG}
+
+It needs docker, the SSM agent, ~200 GB free on / and an instance role that can push to
+ECR (AmazonEC2ContainerRegistryPowerUser). To list candidates:
+
+    aws ec2 describe-instances --region ${REGION} \\
+      --filters Name=instance-state-name,Values=running \\
+      --query 'Reservations[].Instances[].[InstanceId,InstanceType]' --output text
+USAGE
+    exit 2
+fi
 REPO="${REPO:-strands-decider-serving}"
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 TRITON_IMAGE="${TRITON_IMAGE:-763104351884.dkr.ecr.us-west-2.amazonaws.com/sagemaker-tritonserver:25.04-py3}"
@@ -76,9 +94,21 @@ aws s3 sync "$STAGE" "s3://${BUCKET}/${PREFIX}/" --delete --only-show-errors --r
 aws ecr describe-repositories --repository-names "$REPO" --region "$REGION" >/dev/null 2>&1 \
   || aws ecr create-repository --repository-name "$REPO" --region "$REGION" >/dev/null
 
+# WARNING, and it is not what the BuildKit-secret wording suggests. The token is a
+# BuildKit secret inside the build, so it never lands in an image layer -- but to get it
+# to the box it is interpolated into the remote script below, which is base64'd and sent
+# as an SSM `send-command` parameter. SSM RETAINS command parameters in command history
+# (and shows them in the console), so anyone with ssm:GetCommandInvocation or
+# ssm:ListCommands in this account can read the token back out. Base64 is not encryption.
+#
+# So: only pass HF_TOKEN when the checkpoint repo actually requires one, use a short-lived
+# read-only token, and rotate it after the build. A proper fix is to put the token in
+# Secrets Manager or an SSM SecureString and have the remote script fetch it by name, so
+# only the name travels through command history.
 SECRET_ARG=""
 if [ -n "${HF_TOKEN:-}" ]; then
     echo "==> HF_TOKEN present; passing it as a BuildKit secret"
+    echo "    NOTE: it also enters SSM command history on this account. Rotate it after."
     SECRET_ARG='--secret id=hf_token,src=/tmp/ctx/hf_token'
 fi
 
