@@ -29,6 +29,7 @@ calibration test.
 
 Usage:
     reference_check.py --base http://localhost:8100 --path /invocations --triton
+    reference_check.py --endpoint sd-batchgeom          # a live SageMaker endpoint
 """
 
 from __future__ import annotations
@@ -75,15 +76,7 @@ CASES: list[dict] = [
 ]
 
 
-def post(url: str, payload: dict, triton: bool, timeout: float = 300.0) -> dict:
-    if triton:
-        payload = {"inputs": [{"name": "REQUEST_JSON", "shape": [1, 1],
-                               "datatype": "BYTES", "data": [json.dumps(payload)]}]}
-    req = urllib.request.Request(url, data=json.dumps(payload).encode(),
-                                 headers={"Content-Type": "application/json"},
-                                 method="POST")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        out = json.loads(resp.read().decode())
+def _unwrap(out: dict, triton: bool) -> dict:
     if not triton:
         return out
     if "error" in out and "outputs" not in out:
@@ -92,6 +85,43 @@ def post(url: str, payload: dict, triton: bool, timeout: float = 300.0) -> dict:
         if o.get("name") == "RESPONSE_JSON":
             return json.loads(o["data"][0])
     raise ValueError(f"no RESPONSE_JSON in {sorted(out)}")
+
+
+def _envelope(payload: dict, triton: bool) -> dict:
+    if not triton:
+        return payload
+    return {"inputs": [{"name": "REQUEST_JSON", "shape": [1, 1],
+                        "datatype": "BYTES", "data": [json.dumps(payload)]}]}
+
+
+def post(url: str, payload: dict, triton: bool, timeout: float = 300.0) -> dict:
+    req = urllib.request.Request(url, data=json.dumps(_envelope(payload, triton)).encode(),
+                                 headers={"Content-Type": "application/json"},
+                                 method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        out = json.loads(resp.read().decode())
+    return _unwrap(out, triton)
+
+
+def post_endpoint(endpoint: str, region: str, payload: dict) -> dict:
+    """The same three checks against a live SageMaker endpoint.
+
+    Needed because this gate is most valuable exactly where `--base` cannot reach: a
+    deployed endpoint is the only place the overlay, the real GPU kernels and the actual
+    served `config.pbtxt` all appear together. Running the check against localhost proves
+    the code is right and says nothing about what the endpoint is serving.
+
+    Always the Triton envelope -- the endpoint IS the Triton deployable, so there is no
+    second wire format to choose between and no flag to get wrong.
+    """
+    import boto3
+    from botocore.config import Config
+
+    rt = boto3.client("sagemaker-runtime", region_name=region,
+                      config=Config(retries={"max_attempts": 0}, read_timeout=300))
+    resp = rt.invoke_endpoint(EndpointName=endpoint, ContentType="application/json",
+                              Body=json.dumps(_envelope(payload, True)))
+    return _unwrap(json.loads(resp["Body"].read().decode()), True)
 
 
 def check(answer: dict, expect: dict, warn: float) -> tuple[bool, list[str]]:
@@ -139,20 +169,38 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--base", default="http://localhost:8100")
     ap.add_argument("--path", default="/invocations")
+    ap.add_argument("--endpoint", default="",
+                    help="a live SageMaker endpoint name; overrides --base and implies "
+                         "the Triton envelope")
+    ap.add_argument("--region", default="us-west-2")
     ap.add_argument("--triton", action="store_true",
                     help="wrap in the KServe v2 envelope (the Triton deployable)")
     ap.add_argument("--warn", type=float, default=0.02)
     args = ap.parse_args()
 
-    url = args.base.rstrip("/") + args.path
-    print(f"[ref] {url}  (published v21 reference values)")
+    if args.endpoint:
+        target = f"sagemaker://{args.endpoint}"
+
+        def fetch(payload):
+            return post_endpoint(args.endpoint, args.region, payload)
+    else:
+        url = args.base.rstrip("/") + args.path
+        target = url
+
+        def fetch(payload):
+            return post(url, payload, args.triton)
+
+    print(f"[ref] {target}  (published v21 reference values)")
     failures = 0
     for case in CASES:
         print(f"\n[ref] --- {case['name']}")
         try:
-            body = post(url, {"state": STATE, "questions": case["questions"]},
-                        args.triton)
-        except (urllib.error.URLError, urllib.error.HTTPError, ValueError) as exc:
+            body = fetch({"state": STATE, "questions": case["questions"]})
+        # Broad on purpose: the three transports raise three unrelated families
+        # (urllib.error, botocore ClientError, ValueError from the unwrap), and a failed
+        # case is a RESULT to be counted and printed, not a reason to abandon the other
+        # two. The exit code still reflects it.
+        except Exception as exc:
             detail = ""
             if isinstance(exc, urllib.error.HTTPError):
                 try:

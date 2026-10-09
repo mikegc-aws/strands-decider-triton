@@ -403,6 +403,24 @@ def test_shard_threads_are_balanced(bench_tickets):
     assert sorted(shards) == [2, 2, 3, 3]
 
 
+def test_startup_grace_scales_with_the_shard_count(bench_tickets):
+    """The barrier budget. Every shard must finish forking and building a boto3 client
+    BEFORE the measurement window opens, or it measures a short window and the parent still
+    divides by the full `--seconds`.
+
+    MEASURED cost of getting this wrong, against Little's law on a live L40S endpoint: the
+    cells with one thread per process read 0.82x and 0.45x of concurrency/e2e-p50 while
+    every cell with two or more threads read 1.03-1.31x. That asymmetry -- a deficit only
+    where a shard issues few requests -- is the signature of fixed startup inside the
+    window, and it is almost certainly the 'bistability' previously filed as undiagnosed.
+    """
+    assert bench_tickets.startup_grace(1) < bench_tickets.startup_grace(32)
+    # Enough slack for a 32-way pool at the measured ~1 s per client, without making a
+    # 15-second cell mostly waiting.
+    assert bench_tickets.startup_grace(32) >= 12.0
+    assert bench_tickets.startup_grace(1) >= 3.0
+
+
 def test_cpu_sampler_reports_a_usable_percentage(bench_tickets):
     """`loadgen_cpu_pct` is the evidence that a headline number is not client-bound, so it
     must be populated on every platform -- there is no /proc on macOS, where the harness's

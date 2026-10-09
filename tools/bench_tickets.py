@@ -259,8 +259,51 @@ def _run_shard(spec: dict) -> tuple[list[float], list[float], list[int], list[st
     server: list[float] = []
     tokens: list[int] = []
     errs: list[str] = []
+
+    # Build the client BEFORE the barrier. Constructing a botocore client loads and parses
+    # the service JSON and costs ~0.5-1.5 s, and `fork` of a 16-way pool serialises some of
+    # that -- so without the barrier the setup is charged to the measurement window.
     invoke = _make_invoke(spec["endpoint"], spec["base"], spec["region"])
-    deadline_mono = time.monotonic() + max(0.0, spec["deadline"] - time.time())
+
+    # THE BARRIER, and why it is load-bearing rather than tidy.
+    #
+    # Every shard waits for one absolute wall-clock instant and then runs for exactly
+    # `seconds`, so throughput is `requests / seconds` for real. Without it each shard
+    # started when it happened to finish forking, ran for LESS than `seconds`, and the
+    # parent still divided by the full `seconds` -- so the cell under-reported by whatever
+    # fraction of the window startup ate.
+    #
+    # MEASURED, and it is not small. On an L40S endpoint at 15 s per cell, against
+    # Little's law (concurrency / end-to-end p50, which the server's own flat p50 makes a
+    # reliable cross-check):
+    #
+    #     concurrency  processes  threads/proc  measured  N/e2e_p50  ratio
+    #       1             1           1           9.87      9.73     1.01   <- no fork
+    #       8             8           1          25.73     31.31     0.82
+    #      16            16           1          17.67     38.85     0.45   <- 55% low
+    #      32            16           2          40.07     38.78     1.03
+    #      64            16           4          42.20     38.78     1.09
+    #
+    # The deficit lands exactly on the cells with ONE thread per process, because a shard
+    # issuing one request at a time completes only tens of requests in 15 s, so a few
+    # seconds of startup is tens of percent of its output. Cells with two or more threads
+    # per process amortise it and agree with Little's law.
+    #
+    # This is almost certainly the "bistability" previously recorded as undiagnosed: two
+    # cells at concurrency 17 reading 23.4-23.7 tickets/s where neighbours and repeats gave
+    # 39-44, at UNCHANGED server p50 and zero errors. A real batching collapse would move
+    # the server's own latency; a client that measured itself for part of the window does
+    # not, which is exactly the signature reported.
+    start = spec["start"]
+    now = time.time()
+    if start > now:
+        time.sleep(start - now)
+    else:
+        # Setup overran the grace period. Say so rather than silently producing the short
+        # window this barrier exists to prevent.
+        errs.append(f"shard missed the start barrier by {now - start:.2f}s")
+
+    deadline_mono = time.monotonic() + spec["seconds"]
     threads = max(1, spec["threads"])
     with ThreadPoolExecutor(max_workers=threads) as ex:
         futs = [ex.submit(drive, invoke, spec["payloads"],
@@ -270,6 +313,18 @@ def _run_shard(spec: dict) -> tuple[list[float], list[float], list[int], list[st
         for fut in futs:
             fut.result()
     return lats, server, tokens, errs
+
+
+def startup_grace(nproc: int) -> float:
+    """Wall-clock budget for every shard to fork and build its boto3 client.
+
+    Scales with the shard count because the cost is mostly contended CPU and page-cache
+    work during `fork` plus service-model parsing, not a constant. Measured at ~1 s per
+    client on a c7i; 0.4 s per shard plus 3 s of slack covers a 32-way pool with room, and
+    a shard that still misses the barrier records an error rather than quietly measuring a
+    short window.
+    """
+    return 3.0 + 0.4 * nproc
 
 
 def split_threads(conc: int, processes: int) -> list[int]:
@@ -343,6 +398,17 @@ def main() -> int:
     ap.add_argument("--seconds", type=float, default=20.0)
     ap.add_argument("--concurrency", default="1,4,8,16,32")
     ap.add_argument("--qcounts", default="1,3,7,14")
+    ap.add_argument("--questions", type=int, default=7,
+                    help="questions per request for the CONCURRENCY sweep (section 1). "
+                         "7 is the production set and the default, so the published table "
+                         "is unchanged. Raising it is how you vary ROWS PER PASS without "
+                         "redeploying: rows = batch size x questions, so 8 requests x 14 "
+                         "questions puts 112 rows through a pass that normally carries 56, "
+                         "which is the same row count as max_batch_size 16 at 7 questions")
+    ap.add_argument("--sections", default="1,2,3",
+                    help="which sections to run. A full run is ~15 cells; when an endpoint "
+                         "costs $3.76/hr and each configuration needs a fresh one, paying "
+                         "for cells you will not read is real money")
     ap.add_argument("--tickets", default="distinct", choices=["distinct", "identical"],
                     help="distinct (default, realistic) sends a different ticket per "
                          "request; identical sends one ticket, which lets the backend's "
@@ -391,14 +457,16 @@ def main() -> int:
                 for fut in futs:
                     fut.result()
         else:
-            # Wall-clock (not monotonic) deadline, because it has to mean the same instant
-            # in every child; each child converts it back to its own monotonic clock.
-            deadline = time.time() + args.seconds
+            # A wall-clock START (not a deadline), because it has to mean the same instant
+            # in every child; each child sleeps until it, then runs for exactly `seconds`
+            # on its own monotonic clock. See the barrier comment in `_run_shard`.
+            start = time.time() + startup_grace(nproc)
             specs, offset = [], 0
             for threads in shards:
                 specs.append({"endpoint": args.endpoint, "base": args.base,
                               "region": args.region, "payloads": payloads,
-                              "threads": threads, "deadline": deadline,
+                              "threads": threads, "start": start,
+                              "seconds": args.seconds,
                               # Stride by the TOTAL thread count across all processes, so
                               # the pool walk stays interleaved rather than every shard
                               # replaying the same slice of tickets.
@@ -440,22 +508,29 @@ def main() -> int:
             if args.tickets == "distinct" else [WITH_DOC])
     rows = []
 
-    print(f"\n[bench] ticket mode: {args.tickets} (pool of {len(pool)})", flush=True)
-    print("\n=== 1. concurrency sweep, 7 questions, plain ticket "
-          "(the published table's shape)", flush=True)
-    for conc in [int(c) for c in args.concurrency.split(",")]:
-        rows.append(cell("plain/7q", pool, questions(7), conc))
+    want = {s.strip() for s in args.sections.split(",") if s.strip()}
+    nq1 = args.questions
 
-    print("\n=== 2. question-count sweep at concurrency 1 "
-          "(fixed per-request cost vs marginal per question)", flush=True)
-    for nq in [int(q) for q in args.qcounts.split(",")]:
-        rows.append(cell(f"plain/{nq}q", pool, questions(nq), 1))
+    print(f"\n[bench] ticket mode: {args.tickets} (pool of {len(pool)}), "
+          f"processes {args.processes}", flush=True)
+    if "1" in want:
+        print(f"\n=== 1. concurrency sweep, {nq1} questions, plain ticket "
+              "(the published table's shape)", flush=True)
+        for conc in [int(c) for c in args.concurrency.split(",")]:
+            rows.append(cell(f"plain/{nq1}q", pool, questions(nq1), conc))
 
-    print("\n=== 3. ticket length, 7 questions "
-          "(the '~400-token document costs ~4x throughput' claim)", flush=True)
-    for name, tix in (("plain", pool), ("with_document", docs)):
-        for conc in (1, 8):
-            rows.append(cell(f"{name}/7q", tix, questions(7), conc))
+    if "2" in want:
+        print("\n=== 2. question-count sweep at concurrency 1 "
+              "(fixed per-request cost vs marginal per question)", flush=True)
+        for nq in [int(q) for q in args.qcounts.split(",")]:
+            rows.append(cell(f"plain/{nq}q", pool, questions(nq), 1))
+
+    if "3" in want:
+        print("\n=== 3. ticket length, 7 questions "
+              "(the '~400-token document costs ~4x throughput' claim)", flush=True)
+        for name, tix in (("plain", pool), ("with_document", docs)):
+            for conc in (1, 8):
+                rows.append(cell(f"{name}/7q", tix, questions(7), conc))
 
     if args.out:
         with open(args.out, "w") as fh:
