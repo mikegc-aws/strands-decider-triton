@@ -234,6 +234,38 @@ parameters [
     value: { string_value: "128" }
   },
   {
+    # Fused inference kernels (strands_decider/fused_layers.py). OFF by default.
+    #
+    # Listed here for the same reason `SD_CUDA_GRAPHS` is: `model.py` reads it through
+    # `param()`, which looks at this block first and the container environment second, so
+    # an absent key still works -- but it leaves the knob invisible to anyone reading the
+    # model repository, and invisible is how it went un-deployed. Every published fusion
+    # number was taken in-process on a build box because no pushed image carried the code
+    # at all (v23-triton-onepass, 2026-10-07, predates commit cf8cb53), and two agents in a
+    # row set this env var on that image, got silence, and believed the result.
+    #
+    # `1` replaces the torso's decoder layers with flash-linear-attention's Triton kernels.
+    # It is a THROUGHPUT lever, not a latency one, and the two regimes go opposite ways:
+    # measured 1.29x on a full 56-row batch (103.8 -> 133.7 decisions/s) and 0.85x on a
+    # 128-token batch-1 torso forward, on an L4. A small pass is CPU-dispatch-bound and
+    # fla's ops carry more Python per call; a full pass is bandwidth-bound and doing less
+    # arithmetic is exactly what helps.
+    #
+    # Fusion changes the ROUNDING, not the maths -- it keeps fp32 where the reference
+    # rounds to bf16 mid-formula. Measured: zero decision flips, max |dp| 0.0102, which is
+    # above this project's 7e-3 advisory band. `tools/fused_ab.py --fp32-reference` settles
+    # that: against the same torso in fp32 the reference bf16 path sits 0.00105 away on
+    # average and the fused path 0.00124. Both bf16 paths are about equally far from exact
+    # and simply not close to each other, which is rounding rather than a kernel error.
+    #
+    # Refused rather than ignored where it cannot be honoured: `SD_ENGINE=hf` raises
+    # (PEFT wraps the layers the fusion replaces), and an engine too old to accept
+    # `fuse_layers` fails `initialize()` rather than serving the unfused torso -- see
+    # `model.py::_engine_kwargs`. Pinned to fla 0.5.2; any other version refuses to fuse.
+    key: "SD_FUSE_LAYERS"
+    value: { string_value: "0" }
+  },
+  {
     # CUDA graph capture. OFF by default. `0` | `1` | `all`.
     #
     # `1` graphs the one-pass route, where the ~45 ms per-pass floor is CPU kernel launches
