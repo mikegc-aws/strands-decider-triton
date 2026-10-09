@@ -60,6 +60,14 @@ output [
 dynamic_batching {
   # Try to fill 4 then 8. Preferred sizes are a hint; Triton still dispatches a smaller
   # batch once the queue delay expires.
+  #
+  # SUSPECT, and the cheap experiment is `preferred_batch_size: [ 8 ]`. Two cells out of 17
+  # on an L40S came in at 23.4 and 23.7 tickets/s where their neighbours -- and a repeat of
+  # the same cell seconds later -- gave 39-44, with the server-side p50 unchanged at 205 ms
+  # and zero errors. Constant batch cost at ~60% of the throughput means ~60% of the batch
+  # size, i.e. ~5 requests per pass instead of 8, so the batcher appears able to settle on
+  # the smaller of its two targets and stay there for a whole 20-second window. Giving it
+  # one target removes the choice. Not yet diagnosed; see README.md, "Known limits".
   preferred_batch_size: [ 4, 8 ]
 
   # 2 ms. The number worth understanding rather than copying: this is pure added latency
@@ -134,6 +142,50 @@ instance_group [
     # vCPU too (ml.g6e.2xlarge is 8 vCPU). Move it together with max_batch_size, so that
     # count x max_batch_size x questions still lands at or just under max_rows; raising
     # count alone is what produced the table above.
+    #
+    # THAT RETEST IS NOW DONE, on the most favourable host the fleet offers: one L40S with
+    # 64 vCPU (ml.g6e.16xlarge), where count: 1 leaves the GPU at 71-80% and uses ~1.5 of
+    # the 64 cores. All three rows are the SAME instance type, harness and load generator;
+    # only the overlaid config.pbtxt differs. Decisions/s:
+    #
+    #     c            count: 1   count: 2    count: 4
+    #       1             69.6       68.6        63.0
+    #       8            210.7      194.6       140.3
+    #      16            273.0      205.1       255.8
+    #      32            273-279    292.2       140.7 (a preferred_batch_size stall)
+    #      64            289.4      303.8       305.6
+    #     128            310.8      325-343     318.8
+    #     192            331.1      353.5       355.6
+    #     256              --       364.7       376.9
+    #   server p50       205 ms   371-392 ms  754-768 ms
+    #   server p95, c=8  141 ms      225 ms     1822 ms
+    #   GPU util         71-80%     93-100%      100%
+    #   GPU memory        14.2%       27.3%      53.8%
+    #
+    # So 1 -> 2 -> 4 copies buys +7% and then +0.6% at the very top of the concurrency
+    # range, is WORSE at every concurrency a latency-sensitive caller would use (0.67x at
+    # c=8 for count: 4), and multiplies the server-side p50 BY THE COUNT, because each
+    # batcher runs its own full 56-row pass against a card it now shares. count: 4's p95 at
+    # c=8 is 13x count: 1's. count: 1 stays the default.
+    #
+    # The utilisation column is again the lesson. count: 2 takes the GPU from 71-80% to
+    # 93-100% and returns 7% more work; count: 4 pins it at 100% and returns nothing
+    # further. The 20-25% of "idle" GPU was not 20-25% of available throughput: a filled
+    # pass is memory-bandwidth-bound, and a second process competing for the same bandwidth
+    # mostly makes both passes slower. The L4's -10% and the L40S's +7% are one mechanism
+    # with different amounts of slack.
+    #
+    # And more vCPU was never the missing ingredient: 16 vCPU and 64 vCPU deliver the same
+    # decisions/s at every concurrency on this card, and both match the 4-vCPU figure at the
+    # same concurrency. The binding constraint is max_batch_size above, not the host. See
+    # README.md, "The L40S ladder".
+    #
+    # TO CHANGE THIS WITHOUT REBUILDING THE 20.6 GB IMAGE: pack the whole decider/ directory
+    # -- this file AND 1/model.py -- into a model.tar.gz and pass it as --model-data-url.
+    # SageMaker extracts it over /opt/ml/model, which is where this repository lives. Take
+    # BOTH files from the commit that built the image: the overlay replaces the model
+    # repository, not the strands_decider package it imports, and a newer model.py against
+    # an older package fails initialize() with a TypeError on load_merged_engine's kwargs.
     count: 1
     kind: KIND_GPU
   }

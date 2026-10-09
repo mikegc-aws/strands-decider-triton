@@ -100,23 +100,47 @@ DEFAULT_INSTANCE = "ml.g6.xlarge"
 # It is worse value only if your traffic is thin enough that you never leave concurrency 1,
 # where you would be paying 2.31x for 4%.
 #
-# TWO CAVEATS, both honest limits of the measurement above:
-#  * The g6e row is a LOWER BOUND. Its server-side p50 is only 209 ms, i.e. the server was
-#    not deeply queued, while the implied end-to-end latency was far higher -- so the 4-vCPU
-#    load generator, not the endpoint, is what 269.8 decisions/s measures. The g6 row is a
-#    real ceiling (p50 620 ms is the server queueing). A fatter load generator would raise
-#    the g6e number and not the g6 one.
-#  * 1-2 requests out of ~770 errored in the g6e c=16 and c=32 cells. Not enough to move the
-#    throughput figure, and not diagnosed.
+# THE g6e ROW WAS PUBLISHED AS A LOWER BOUND AND THAT CAVEAT WAS WRONG. The reasoning was
+# that a server-side p50 of only 209 ms meant the server was not deeply queued, so 269.8
+# decisions/s had to be what the 4-vCPU load generator could drive. It does not mean that:
+# `latency_ms` is timed from the top of model.py's execute(), which Triton calls AFTER the
+# dynamic batcher has formed a batch, so it measures ONE PASS PAIR and excludes the queue
+# wait completely. Under load it converges on the cost of a full pass and stays there
+# forever. Re-measured from a dedicated c7i.8xlarge load generator (32 vCPU, nothing else on
+# it, `bench_tickets.py --processes 16`), 7 questions, distinct tickets:
+#
+#   instance         vCPU   $/hr     dec/s c=32   dec/s c=192   server p50   $/1,000 tickets
+#   ml.g6e.4xlarge    16    3.7553      277.6        325.8        205 ms         0.0224
+#   ml.g6e.16xlarge   64    9.4715      273-279      331.1        208 ms         0.0556
+#
+# Sixteen times the vCPU buys NOTHING, and both agree at c=32 with the 269.8 already
+# published for FOUR vCPU. The limit is `max_batch_size`: 8 requests x 7 questions = 56 rows,
+# 56 rows in 205 ms is 273 decisions/s, which is the c=32 column. The climb to ~331 at c=192
+# is a deeper queue keeping the batcher always full, not a faster host. Load-generator CPU
+# stayed under 0.7% in every cell and doubling the client processes at fixed offered load
+# moved throughput by <0.4%, which is what makes these the server's numbers and not the
+# client's. See README.md, "The L40S ladder".
+#
+# Two other honest limits:
+#  * 1-2 requests out of ~770 errored in the original g6e c=16 and c=32 cells. Not diagnosed.
+#    Zero of ~45,000 requests errored in the re-measurement.
+#  * ml.g6e.xlarge and ml.g6e.2xlarge are absent from the table because they had no capacity:
+#    six single-type CreateEndpoint attempts failed InsufficientInstanceCapacity at ~31
+#    minutes each. The remedy is a production variant with up to five `InstancePools`
+#    entries (Priority 1-5), which SageMaker places in order -- one pooled attempt landed
+#    ml.g6e.4xlarge immediately after three serial attempts had failed. It needs a recent
+#    botocore: absent in boto3 1.42.97, present in 1.43.110.
 #
 # Also note the prices above are the SageMaker HOSTING rates. The EC2 on-demand rate for
 # g6e.xlarge is ~$1.86/hr; quoting that one under-budgets an endpoint by about 40%.
 #
 # CHECK YOUR QUOTA FIRST, because it is per instance type and is the thing most likely to
-# bite. In the account this was built in: ml.g6.xlarge for endpoint usage = 4, but
-# ml.g6e.xlarge = 1 -- so on g6e.xlarge autoscaling has nowhere to go and the 2.7x has to be
-# enough on its own. `resolve_max_capacity` below reads the real quota rather than trusting
-# DEFAULT_MAX_CAPACITY.
+# bite. In the account this was built in: ml.g6.xlarge for endpoint usage = 4, but EVERY
+# ml.g6e size from xlarge to 16xlarge = 1 (24xlarge and 48xlarge = 0). So on any g6e
+# autoscaling has nowhere to go, AND `UpdateEndpoint` cannot be used to change a config
+# either -- blue/green wants a second instance the quota will not allow, and the call fails.
+# Delete and recreate instead. `resolve_max_capacity` below reads the real quota rather than
+# trusting DEFAULT_MAX_CAPACITY.
 
 # A warm floor of 1, deliberately. Inference Components can scale a model to zero, but GPU
 # cold start here is the image pull plus weight load plus the Gated DeltaNet kernel compile

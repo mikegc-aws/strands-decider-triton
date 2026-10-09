@@ -324,8 +324,14 @@ def test_concat_matches_running_the_projections_separately():
     b = nn.Linear(5, 2, bias=False)
     x = torch.randn(4, 5)
     fused = torch.nn.functional.linear(x, _concat(a, b)).split([3, 2], -1)
-    assert torch.allclose(fused[0], a(x))
-    assert torch.allclose(fused[1], b(x))
+    # atol, matching the rest of this file. One GEMM over the concatenated weight and two
+    # GEMMs over the halves reduce in a different order, so they agree to fp32 rounding and
+    # not bit-exactly -- and `torch.allclose`'s default atol of 1e-8 is tighter than that.
+    # MEASURED: with unseeded inputs this failed roughly 1 run in 5, which is a flaky gate
+    # rather than a detected bug. The property under test is "same weights, same answer",
+    # and 1e-6 states it without asserting a reduction order the kernel never promised.
+    assert torch.allclose(fused[0], a(x), atol=1e-6)
+    assert torch.allclose(fused[1], b(x), atol=1e-6)
 
 
 def test_the_deltanet_split_reverses_the_deltanet_concat():

@@ -317,19 +317,143 @@ only if your traffic never leaves concurrency 1, where you would pay 2.31× for 
 
 Three things to know before you rely on this:
 
-- **The `g6e` row is a lower bound.** Its server-side p50 was only 209 ms — the server was
-  not deeply queued — so 269.8 decisions/s is what the 4-vCPU *load generator* could drive,
-  not the endpoint's ceiling. The `g6` row is a real ceiling (p50 620 ms is the server
-  queueing). A fatter load generator would raise one number and not the other. 1–2 requests
-  of ~770 also errored in the `g6e` c=16/32 cells, undiagnosed.
+- **The `g6e` row was published as a lower bound, and that caveat was wrong** — see
+  [the L40S ladder](#the-l40s-ladder-vcpu-is-not-the-lever) below. The reasoning was that a
+  server-side p50 of only 209 ms meant the server was not deeply queued. It does not:
+  `latency_ms` is timed from the top of `execute()`, so it is the cost of a *batch* and
+  **excludes the dynamic batcher's queue wait entirely**. A server p50 that stops moving is
+  evidence the batcher is always full, not evidence that it is empty. Re-measured from a
+  dedicated 32-vCPU load generator, 4 vCPU reaches the same decisions/s as 64 vCPU at the
+  same concurrency. 1–2 requests of ~770 did error in the `g6e` c=16/32 cells, undiagnosed;
+  none of the ~45,000 requests in the ladder below errored.
 - **Those are SageMaker *hosting* rates, not EC2 rates.** `g6e.xlarge` on EC2 on-demand is
   ~$1.86/hr; as a SageMaker endpoint it is $2.6054/hr. The EC2 number under-budgets by ~40%.
 - **The endpoint-usage quota is per instance type and they differ.** In the account this was
-  built in, `ml.g6.xlarge for endpoint usage` is **4** but `ml.g6e.xlarge` is **1** — so on
-  `g6e.xlarge` autoscaling has nowhere to go and the 2.7× has to be enough by itself.
-  `create_endpoint.py` now reads the real quota and clamps, because `application-autoscaling`
+  built in, `ml.g6.xlarge for endpoint usage` is **4** but **every `ml.g6e` size from
+  `xlarge` to `16xlarge` is 1** (`24xlarge` and `48xlarge` are 0) — so on any `g6e`
+  autoscaling has nowhere to go, and a config change cannot use `UpdateEndpoint` either,
+  because blue/green needs a second instance the quota will not allow. Delete and recreate.
+  `create_endpoint.py` reads the real quota and clamps, because `application-autoscaling`
   accepts an impossible maximum without complaint and records the failed scale-out only in a
   scaling activity log.
+
+### The L40S ladder: vCPU is not the lever
+
+The open question after the table above was whether 269.8 decisions/s was the card or the
+4-vCPU host issuing kernel launches. **It is neither: it is `max_batch_size`.**
+
+Measured through live endpoints, 7 questions, distinct tickets, from a **dedicated
+`c7i.8xlarge` load generator** (32 vCPU, nothing else on it) with
+`tools/bench_tickets.py --processes 16`. Every cell's load-generator CPU is in the table
+because without it a throughput number is not a measurement of the server:
+
+| instance | vCPU | $/hr | c | decisions/s | tickets/s | server p50 | e2e p50 | GPU | loadgen CPU | $/1,000 tickets |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `ml.g6e.4xlarge` | 16 | 3.7553 | 1 | 68.2 | 9.8 | 93 ms | 103 ms | — | 0.1% | — |
+| | | | 8 | 214.2 | 30.6 | 121 ms | 245 ms | — | 0.2% | $0.0341 |
+| | | | 32 | 277.6 | 39.7 | 205 ms | 828 ms | — | 0.3% | $0.0263 |
+| | | | 128 | 311.2 | 44.5 | 205 ms | 3,318 ms | — | 0.5% | $0.0235 |
+| | | | **192** | **325.8** | **46.6** | 205 ms | 4,979 ms | — | 0.5% | **$0.0224** |
+| `ml.g6e.16xlarge` | 64 | 9.4715 | 1 | 69.6 | 10.0 | 92 ms | 101 ms | — | 0.1% | — |
+| | | | 8 | 210.7 | 30.1 | 138 ms | 240 ms | — | 0.2% | $0.0874 |
+| | | | 32 | 273–279 | 39.0–39.8 | 206 ms | 835 ms | 71–80% | 0.4% | $0.0663 |
+| | | | 128 | 310.8 | 44.4 | 207 ms | 3,342 ms | — | 0.4% | $0.0593 |
+| | | | **192** | **331.1** | **47.3** | 208 ms | 5,019 ms | — | 0.6% | **$0.0556** |
+
+`ml.g6e.xlarge` (4 vCPU) and `ml.g6e.2xlarge` (8 vCPU) are **missing because they had no
+capacity** — see [capacity](#capacity-instancepools-not-a-retry-loop).
+
+**Read the two instances against each other and they are the same machine.** 16 vCPU and
+64 vCPU agree to within noise at every concurrency — 311.2 against 310.8 at c=128, server
+p50 205 ms against 207 ms — and both agree at c=32 with the 269.8 decisions/s already
+published for **4** vCPU. Sixteen times the vCPU buys nothing. The hypothesis that the
+4-vCPU host was the limit is dead.
+
+**What the limit actually is.** At saturation server p50 pins at ~205 ms and never moves,
+while end-to-end p50 rises exactly linearly with concurrency (828 → 1,670 → 3,318 →
+4,979 ms at c=32/64/128/192). That is a queue in front of a server running flat out, and
+the arithmetic closes: `max_batch_size: 8` × 7 questions = 56 rows per pass pair, 56 rows
+in 205 ms is **273 decisions/s**, which is the c=32 number. The rest — the climb to ~331 at
+c=192 — is a deeper queue keeping the batcher always full rather than occasionally
+dispatching a short batch. So **throughput ≈ `max_batch_size` ÷ batch latency**, and the
+next lever is batch geometry, not the host.
+
+The 205 ms is the card: the same 56-row pass costs ~611 ms on an L4 (README's
+`instance_group` table), and 611/205 = 2.98× against the L40S's 2.88× memory-bandwidth
+advantage.
+
+**Proof that the load generator was not the limit**, both tests, in every cell:
+
+- load-generator CPU never exceeded **0.7%** of a 32-vCPU box while the server's
+  end-to-end p50 was in seconds, and
+- doubling the client processes at fixed offered load moved nothing: c=64 gave 289.4
+  decisions/s at `--processes 16` and 289.4 at `--processes 32`; c=128 gave 310.8 and
+  311.8. If the client had been the constraint, more of it would have bought more
+  throughput.
+
+**Where to operate.** c=8 is the interesting row: 214 decisions/s at a 245 ms end-to-end
+p50, i.e. 65–69% of the ceiling for ~1/14th of the tail latency at c=192. Past c≈32 you are
+buying throughput with seconds of queueing.
+
+### `instance_group count` on an L40S: +7% at best, N× the latency always
+
+On the L4 this was measured at **−10%** and the explanation was that the card was genuinely
+saturated. On the L40S `count: 1` leaves the GPU at 71–80% with the host using ~1.5 of its
+64 cores, so there was real headroom to aim at. All three rows are the **same instance
+type** (`ml.g6e.16xlarge`), the same harness and the same load generator; only the overlaid
+`config.pbtxt` differs. Decisions/s:
+
+| c | `count: 1` | `count: 2` | `count: 4` |
+| --- | --- | --- | --- |
+| 1 | 69.6 | 68.6 | 63.0 |
+| 8 | **210.7** | 194.6 | 140.3 |
+| 16 | **273.0** | 205.1 | 255.8 |
+| 32 | 273–279 | **292.2** | 140.7 ⁽*⁾ |
+| 64 | 289.4 | 303.8 | **305.6** |
+| 128 | 310.8 | **325.5–343.3** | 318.8 |
+| 192 | 331.1 | 353.5 | **355.6** |
+| 256 | not measured | 364.7 | **376.9** |
+| server p50 at saturation | **205 ms** | 371–392 ms | 754–768 ms |
+| server p95 at c=8 | **141 ms** | 225 ms | 1,822 ms |
+| GPU util under load | 71–80% | 93–100% | 100% |
+| GPU memory | 14.2% | 27.3% | 53.8% |
+| $/1,000 tickets, best cell | $0.0556 | $0.0505 | $0.0490 |
+
+⁽*⁾ a `preferred_batch_size` stall, not a `count: 4` property — see
+[Known limits](#known-limits). Its p95 was 7.8 s.
+
+**`count: 1` stays the default, and the table says why more plainly than the L4 one did.**
+Going from 1 → 2 → 4 model copies buys +7% and then +0.6% at the very top of the
+concurrency range, is **worse at every concurrency a latency-sensitive caller would use**
+(0.67× at c=8 for `count: 4`), and multiplies the server-side p50 by the count — each
+batcher runs its own full 56-row pass against a card it now shares. `count: 4`'s p95 at
+c=8 is **13× `count: 1`'s**.
+
+**The utilisation column is the lesson.** `count: 2` takes the GPU from 71–80% to 93–100%
+and returns 7% more work; `count: 4` pins it at 100% and returns nothing further. The
+20–25% of "idle" GPU was not 20–25% of available throughput: a filled pass is
+memory-bandwidth-bound, so a second process competing for the same bandwidth mostly makes
+both passes slower. The L4's −10% and the L40S's +7% are one mechanism with different
+amounts of slack, which is why "GPU util is high" remains not-evidence that the GPU is the
+bottleneck — and "GPU util is 75%" is not evidence that 25% is available either.
+
+Memory never binds: 4 copies of the weights sit in 53.8% of the L40S's 45.8 GB.
+
+### Capacity: `InstancePools`, not a retry loop
+
+`ml.g6e` capacity in us-west-2 was the hard constraint on this ladder, not money or time.
+Measured over one session: **six** single-instance-type `CreateEndpoint` attempts across
+`xlarge`, `2xlarge` and `4xlarge` all failed `InsufficientInstanceCapacity`, each taking
+~31 minutes to say so. `16xlarge` landed twice in ~8 minutes.
+
+The remedy is in the error message AWS returns, and it works: a production variant may
+carry up to **five** `InstancePools` entries with `Priority` 1–5, and SageMaker places the
+first that has capacity. One pooled attempt at `[4xlarge, 2xlarge, xlarge]` landed
+`4xlarge` immediately after three serial attempts had failed. `DescribeEndpoint` reports
+which pool won under `ProductionVariants[].InstancePools[].InstanceType`.
+
+Two constraints worth knowing: the list is capped at 5 (a 6th is a `ValidationException`),
+and it needs a recent botocore — it is absent from boto3 1.42.97 and present in 1.43.110.
 
 And still **not `ml.g5`**: that fleet's host drivers (470.x, 535.x) are too old for any
 current Triton DLC. It was tried on both CUDA 12 and CUDA 13 and failed both times; the
@@ -399,10 +523,11 @@ loud:
 
 | knob | where | note |
 | --- | --- | --- |
-| `max_batch_size` | `config.pbtxt` | Requests coalesced per `execute()`. **8**, measured. Keep `max_batch_size × typical questions` at or just under `max_rows`; 32 was tried and is worse. |
+| `max_batch_size` | `config.pbtxt` | Requests coalesced per `execute()`. **8**, measured. Keep `max_batch_size × typical questions` at or just under `max_rows`; 32 was tried and is worse. **This is the L40S's binding constraint** — throughput there is `max_batch_size` ÷ batch latency, see [the L40S ladder](#the-l40s-ladder-vcpu-is-not-the-lever). |
 | `max_queue_delay_microseconds` | `config.pbtxt` | 2 ms. Pure added latency for a request arriving into an empty queue, so keep it small relative to the work. |
+| `preferred_batch_size` | `config.pbtxt` | `[4, 8]`. **Suspect.** Two cells of 17 on the L40S delivered 59–60% of their neighbours (165 against 273–311 decisions/s) at an unchanged server p50, which is what forming 5-request batches instead of 8 looks like. See [Known limits](#known-limits). |
 | `max_queue_size` | `config.pbtxt` | 256, then reject. Bounded shedding beats unbounded latency — a load balancer can act on a refusal. |
-| `instance_group count` | `config.pbtxt` | **1**, measured. 2 and 3 both fit in memory and are both *worse* — 91.4 and 79.8 decisions/s against 101.5. See [below](#instance_group-count-measured-1-wins). |
+| `instance_group count` | `config.pbtxt` | **1**. On the L4, 2 and 3 are *worse* (91.4 and 79.8 against 101.5). On an L40S with 64 vCPU, 2 is **0.75× below c≈32 and 1.07× above it**, 4 adds nothing beyond that, and each multiplies server p50 by the count — see [below](#instance_group-count-measured-1-wins) and [the L40S result](#instance_group-count-on-an-l40s-7-at-best-n-the-latency-always). Changing it needs no rebuild: pack `decider/` with the edited `config.pbtxt` and pass `--model-data-url`. |
 | `max_rows` | `BatchedSystemOneEngine` | 128 question rows per pass. Activation memory for the whole in-flight batch. |
 | `DUP_TOKEN_BUDGET` | `BatchedSystemOneEngine` | 480. Above this many duplicated state tokens, encoding the state once and forking the cache beats a single combined pass. |
 | `SD_ENGINE`, `SD_PREFIX_CACHE` | container env | `merged` folds the LoRA into the torso (no PEFT at runtime). Prefix caching on. |
@@ -506,8 +631,48 @@ this model.
 `count × max_batch_size × questions` still lands at or just under `max_rows`.
 `ml.g6.2xlarge` (8 vCPU, same L4, ~8% more money) is the cheap place to retest.
 
+That revisit has now happened on an L40S with 64 vCPU, which is the most favourable host
+this fleet offers, and `count: 2` is worth **+7% at deep saturation and −25% at moderate
+load**, with `count: 4` adding nothing further —
+[the L40S result](#instance_group-count-on-an-l40s-7-at-best-n-the-latency-always). More
+vCPU was not the missing ingredient; it was never the constraint.
+
 ## Known limits
 
+- **`latency_ms` does not include the queue, so it cannot tell you whether the server is
+  saturated.** It is timed from the top of `execute()`, which Triton calls *after* the
+  dynamic batcher has formed a batch. Under load it therefore converges on the cost of one
+  full pass pair and stays there — 205 ms on an L40S, 611 ms on an L4 — however deep the
+  queue gets. An earlier version of this README read a flat 209 ms as "the server was not
+  deeply queued" and published a real ceiling as a lower bound because of it. The two
+  signals that actually answer the question are **end-to-end latency rising linearly at
+  constant throughput** (a queue in front of a server running flat out) and **load-generator
+  CPU** (`loadgen_cpu_pct`, in every `bench_tickets.py` row).
+- **Throughput on a fast card is set by `max_batch_size`, not by the host.** 16 vCPU and 64
+  vCPU deliver the same decisions/s on an L40S at every concurrency, and both match the
+  4-vCPU figure at the same concurrency. 56 rows in 205 ms is 273 decisions/s and that is
+  what the card delivers. See [the L40S ladder](#the-l40s-ladder-vcpu-is-not-the-lever).
+  Raising `max_batch_size` together with `max_rows` is the untried lever this points at, and
+  the one caution is that 32 was already tried *without* raising `max_rows` and was much
+  worse.
+- **The dynamic batcher looks bistable at `preferred_batch_size: [4, 8]`.** Two cells out of
+  17 across two instance types came in at 23.4 and 23.7 tickets/s where their neighbours
+  (and a repeat of the same cell seconds later) gave 39–44, with server p50 unchanged at
+  205 ms and zero errors. A constant batch cost at 60% of the throughput means 60% of the
+  batch size, i.e. ~5 requests per pass instead of 8. Not diagnosed; the cheap experiment is
+  `preferred_batch_size: [ 8 ]`, so the batcher has one target instead of two.
+- **No pushed image supports `SD_FUSE_LAYERS` or `SD_CUDA_GRAPHS`.** Both knobs are read by
+  `model.py` and both were added *after* the newest image in ECR
+  (`v23-triton-onepass`, 2026-10-07) was built, so the fused-kernel and CUDA-graph numbers
+  in this README are in-process measurements from the build box and **have never been
+  measured through a deployed endpoint**. Doing so needs a rebuild.
+- **A model-repository overlay replaces the repository, not the package it imports.**
+  `--model-data-url` is extracted over `/opt/ml/model`, so the `decider/1/model.py` in the
+  archive must be the same vintage as the `strands_decider` baked into the image. Shipping
+  HEAD's `model.py` against an older image fails `initialize()` with
+  `TypeError: load_merged_engine() got an unexpected keyword argument`, the container never
+  passes `/ping`, and the endpoint fails ~30 minutes later with "did not pass the ping
+  health check". Take both files from the commit that built the image.
 - **Latency is dispatch-bound; throughput at saturation is not.** One *small* forward pass
   has a ~45 ms floor on an L4 that is CPU kernel-launch overhead (~5,676 launches) against a
   12.7 ms weight-streaming floor, and that floor is what a single request pays — cutting it
