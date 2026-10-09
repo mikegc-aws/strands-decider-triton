@@ -775,11 +775,21 @@ def main() -> int:
                          "'ml.g6e.4xlarge,ml.g6e.2xlarge,ml.g6e.xlarge'. SageMaker falls "
                          "back automatically on InsufficientInstanceCapacity instead of "
                          "failing after ~31 minutes. Max 5; overrides --instance-type")
+    # Declared ONCE. Two merges each added this flag with their own help text
+    # (`perf/batch-geometry` and `perf/l40s-ladder` both wanted overlays), and argparse
+    # raises ArgumentError on a duplicate option string at *parser construction* -- so
+    # `main()` died before `parse_args()` and EVERY invocation failed, including --help and
+    # --delete. That also took `up.py` down with it, since both its deploy path and --down
+    # shell out to this script. Nothing caught it: there is no test that constructs this
+    # parser, which is why `tests/test_deploy.py` now has one.
     ap.add_argument("--model-data-url", default="",
                     help="S3 URI of a model-repository overlay tarball (built by "
-                         "tools/make_overlay.py). Tunes config.pbtxt with no image "
-                         "rebuild. Must contain decider/1/model.py as well as "
-                         "decider/config.pbtxt -- it REPLACES /opt/ml/model")
+                         "tools/make_overlay.py), extracted over /opt/ml/model, i.e. over "
+                         "the Triton model repository. The way to change a Triton-level "
+                         "knob (instance_group count, max_batch_size, SD_MAX_ROWS) with no "
+                         "rebuild of a 20.6 GB image. It REPLACES rather than merges, so "
+                         "the archive must carry the whole decider/ directory -- "
+                         "decider/1/model.py as well as decider/config.pbtxt")
     ap.add_argument("--variant", default="AllTraffic")
     ap.add_argument("--min-capacity", type=int, default=DEFAULT_MIN_CAPACITY)
     ap.add_argument("--max-capacity", type=int, default=DEFAULT_MAX_CAPACITY)
@@ -795,11 +805,6 @@ def main() -> int:
                          "lets the environment win over config.pbtxt, so this is how a "
                          "tuning knob is flipped without rebuilding a 20.6 GB image -- "
                          "e.g. --env SD_FUSE_LAYERS=1 or --env SD_CUDA_GRAPHS=1")
-    ap.add_argument("--model-data-url", default="",
-                    help="s3:// archive extracted over /opt/ml/model, i.e. over the Triton "
-                         "model repository. The way to change a Triton-level knob "
-                         "(instance_group count, max_batch_size) with no rebuild: pack the "
-                         "whole decider/ directory with the edited config.pbtxt")
     ap.add_argument("--replace", action="store_true")
     ap.add_argument("--no-wait", action="store_true")
     ap.add_argument("--delete", action="store_true")

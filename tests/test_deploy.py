@@ -518,3 +518,61 @@ def test_loadsweep_import_does_not_run_a_sweep(monkeypatch):
     # It must still be a usable entry point, not merely inert.
     assert isinstance(module.main, types.FunctionType)
     assert callable(module.cell)
+
+
+# ---- argparse construction ------------------------------------------------------------
+#
+# `--model-data-url` was declared TWICE in create_endpoint.py (two merges each added it
+# with their own help text). argparse raises ArgumentError on a duplicate option string at
+# parser *construction*, so `main()` died before `parse_args()` and every single
+# invocation failed -- deploy, --delete, even --help -- and `up.py` with it, since both its
+# deploy path and --down shell out to create_endpoint.py.
+#
+# Nothing in this file caught it: the fixtures above load each module, which defines
+# `main()` without ever running it. The parser is only built inside `main()`, so only
+# calling `main()` exercises it. `--help` is the cheapest way in: it is handled AFTER the
+# whole parser is assembled, so reaching SystemExit(0) proves every add_argument ran, and
+# it touches no AWS client.
+
+ENTRY_POINTS = [
+    ("deploy/create_endpoint.py", "ep_argparse_create_endpoint"),
+    ("deploy/up.py", "ep_argparse_up"),
+    ("tools/make_overlay.py", "ep_argparse_make_overlay"),
+    ("tools/bench_tickets.py", "ep_argparse_bench_tickets"),
+    ("tools/reference_check.py", "ep_argparse_reference_check"),
+    ("tools/batch_parity.py", "ep_argparse_batch_parity"),
+    ("tools/fused_ab.py", "ep_argparse_fused_ab"),
+    ("tools/loadsweep_triton.py", "ep_argparse_loadsweep"),
+]
+
+
+@pytest.mark.parametrize(("relpath", "modname"), ENTRY_POINTS, ids=[p for p, _ in ENTRY_POINTS])
+def test_entry_point_parser_builds(relpath, modname, monkeypatch, capsys):
+    """Every entry point's argparse parser must assemble without an ArgumentError.
+
+    Guards the duplicate-flag class of bug described above, for all of them rather than
+    just the one that broke: these are eight separate parsers maintained by hand across
+    branches that merge, and a duplicate flag in any of them is a total outage of that
+    script which no other test here would notice.
+    """
+    pytest.importorskip("boto3")
+    module = _load(ROOT / relpath, modname)
+    monkeypatch.setattr(sys, "argv", [relpath, "--help"])
+    with pytest.raises(SystemExit) as excinfo:
+        module.main()
+    # SystemExit(0) is `--help` having printed usage. A non-zero code would mean argparse
+    # rejected its own arguments, which is the same bug class wearing a different hat.
+    assert excinfo.value.code == 0, f"{relpath} --help exited {excinfo.value.code}"
+    assert "usage:" in capsys.readouterr().out
+
+
+def test_create_endpoint_declares_model_data_url_exactly_once():
+    """The specific regression, named, so a re-merge that reintroduces it says why.
+
+    Checked as source text rather than through the parser because argparse keeps only the
+    first of two conflicting declarations once `conflict_handler` is relaxed -- so a future
+    `conflict_handler="resolve"` would make the test above pass while one of the two help
+    texts silently won.
+    """
+    source = (ROOT / "deploy" / "create_endpoint.py").read_text()
+    assert source.count('ap.add_argument("--model-data-url"') == 1
