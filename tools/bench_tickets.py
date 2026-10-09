@@ -28,9 +28,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import resource
 import statistics
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
 import boto3
 from botocore.config import Config
@@ -167,6 +169,168 @@ def drive(invoke, payloads: list[str], start: int, stride: int, deadline: float,
             errs.append(repr(exc)[:150])
 
 
+def _read_proc_stat() -> tuple[float, float] | None:
+    """(busy jiffies, total jiffies) from /proc/stat, or None where there is no /proc."""
+    try:
+        with open("/proc/stat") as fh:
+            parts = fh.readline().split()
+    except OSError:
+        return None
+    if not parts or parts[0] != "cpu":
+        return None
+    values = [float(v) for v in parts[1:]]
+    total = sum(values)
+    # fields: user nice system idle iowait irq softirq steal guest guest_nice
+    idle = values[3] + (values[4] if len(values) > 4 else 0.0)
+    return total - idle, total
+
+
+class CpuSampler:
+    """Loadgen CPU utilisation across a benchmark cell.
+
+    Not decoration. Every throughput number from a load generator is really
+    `min(what the server can serve, what the client can offer)`, and the two are
+    indistinguishable in the output -- this project has already published one figure that
+    turned out to measure a 4-vCPU client rather than the endpoint (see the g6e "LOWER
+    BOUND" caveat in deploy/create_endpoint.py). A client pinned near 100% CPU invalidates
+    the cell; well under 60% is the evidence that it does not.
+
+    Two readings, because they answer different questions:
+
+      * `system`  -- whole-box busy% from /proc/stat. The honest one: it includes the boto3
+        TLS handshakes, the kernel's network stack and anything else sharing the box.
+      * `harness` -- this process and its reaped children, from getrusage, as a percentage
+        of one core times `nproc`. Portable (there is no /proc on macOS) and it attributes
+        the cost to the harness specifically.
+
+    Reported together; `loadgen_cpu_pct` is the system reading where available, because it
+    is the one that can rule the client out as the limit.
+    """
+
+    def __init__(self) -> None:
+        self.ncpu = os.cpu_count() or 1
+        self._wall = time.monotonic()
+        self._stat = _read_proc_stat()
+        self._cpu = self._rusage()
+
+    @staticmethod
+    def _rusage() -> float:
+        total = 0.0
+        for who in (resource.RUSAGE_SELF, resource.RUSAGE_CHILDREN):
+            usage = resource.getrusage(who)
+            total += usage.ru_utime + usage.ru_stime
+        return total
+
+    def read(self) -> dict:
+        elapsed = max(time.monotonic() - self._wall, 1e-6)
+        out: dict = {"loadgen_cpu_pct": None, "loadgen_harness_cpu_pct": None,
+                     "loadgen_vcpu": self.ncpu}
+        now_stat = _read_proc_stat()
+        if self._stat and now_stat:
+            busy = now_stat[0] - self._stat[0]
+            total = now_stat[1] - self._stat[1]
+            if total > 0:
+                out["loadgen_cpu_pct"] = round(100.0 * busy / total, 1)
+        harness = (self._rusage() - self._cpu) / (elapsed * self.ncpu)
+        out["loadgen_harness_cpu_pct"] = round(100.0 * harness, 1)
+        if out["loadgen_cpu_pct"] is None:
+            # No /proc: the harness reading is the best available proxy, so report it as
+            # the headline rather than leaving the field empty and un-judgeable.
+            out["loadgen_cpu_pct"] = out["loadgen_harness_cpu_pct"]
+        return out
+
+
+def _run_shard(spec: dict) -> tuple[list[float], list[float], list[int], list[str]]:
+    """One loadgen PROCESS: build a client, run `threads` threads until `deadline`.
+
+    A separate process rather than more threads because the client is the thing being ruled
+    out, and threads cannot be. `invoke_endpoint` spends its time in JSON encode/decode,
+    SigV4 signing (HMAC in python) and TLS -- all of which hold the GIL -- so one process
+    saturates around one core's worth of request issue no matter how many threads it runs.
+    At 300+ decisions/s that ceiling is close enough to the endpoint's to be mistaken for
+    it. `--processes` is what makes "doubling the client moves nothing" a real check.
+
+    The boto3 client is constructed HERE, inside the child. botocore clients are not
+    fork-safe -- a shared SSL context inherited across a fork produces sporadic handshake
+    errors that look exactly like endpoint-side 5xx noise, which is a measurement bug that
+    reads as a result.
+    """
+    lats: list[float] = []
+    server: list[float] = []
+    tokens: list[int] = []
+    errs: list[str] = []
+    invoke = _make_invoke(spec["endpoint"], spec["base"], spec["region"])
+    deadline_mono = time.monotonic() + max(0.0, spec["deadline"] - time.time())
+    threads = max(1, spec["threads"])
+    with ThreadPoolExecutor(max_workers=threads) as ex:
+        futs = [ex.submit(drive, invoke, spec["payloads"],
+                          spec["offset"] + w, spec["stride"], deadline_mono,
+                          lats, server, tokens, errs)
+                for w in range(threads)]
+        for fut in futs:
+            fut.result()
+    return lats, server, tokens, errs
+
+
+def split_threads(conc: int, processes: int) -> list[int]:
+    """Thread counts per loadgen process, summing to EXACTLY `conc`.
+
+    Exactly, because the sum IS the offered concurrency the cell reports. Rounding each
+    shard up (the obvious `ceil(conc / nproc)` for all) offers more load than the label
+    claims -- at `conc=10, processes=4` it would run 12 threads and attribute the resulting
+    throughput to 10. Remainders are therefore spread one-per-shard instead.
+
+    Never more processes than threads: an empty shard pays process startup, issues nothing,
+    and makes `--processes` look like it changed the answer when all it changed was the
+    number of idle children.
+    """
+    nproc = max(1, min(processes, max(1, conc)))
+    base, extra = divmod(conc, nproc)
+    return [base + (1 if i < extra else 0) for i in range(nproc)]
+
+
+def _make_invoke(endpoint: str, base: str, region: str):
+    """Build the one-request callable. Shared by the in-process and sharded paths."""
+    if endpoint:
+        # retries off, so a failure is an error rather than latency in disguise; pool well
+        # above the concurrency under test, because botocore's default of 10 would
+        # serialise everything past 10 and measure the client.
+        cfg = Config(max_pool_connections=256, retries={"max_attempts": 0},
+                     read_timeout=300, connect_timeout=30)
+        rt = boto3.client("sagemaker-runtime", region_name=region, config=cfg)
+        session = None
+        url = ""
+    else:
+        import requests  # local-only dependency; not needed for the SageMaker path
+
+        rt = None
+        session = requests.Session()
+        session.mount("http://", requests.adapters.HTTPAdapter(
+            pool_connections=256, pool_maxsize=256, max_retries=0))
+        url = base.rstrip("/") + "/invocations"
+
+    def invoke(payload: str):
+        t0 = time.monotonic()
+        if rt is not None:
+            r = rt.invoke_endpoint(EndpointName=endpoint,
+                                   ContentType="application/json", Body=payload)
+            env = json.loads(r["Body"].read().decode())
+        else:
+            resp = session.post(url, data=payload, timeout=300,
+                                headers={"Content-Type": "application/json"})
+            env = resp.json()
+        out = None
+        for o in env.get("outputs") or []:
+            if o.get("name") == "RESPONSE_JSON":
+                out = json.loads(o["data"][0])
+        if out is None or "error" in out:
+            raise RuntimeError(str(out)[:150])
+        usage = out.get("usage") or {}
+        return time.monotonic() - t0, out.get("latency_ms"), usage.get("input_tokens")
+
+    return invoke
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -184,52 +348,27 @@ def main() -> int:
                          "request; identical sends one ticket, which lets the backend's "
                          "same-state merge collapse the batch and inflates throughput")
     ap.add_argument("--pool", type=int, default=64)
+    ap.add_argument("--processes", type=int, default=1,
+                    help="split the offered concurrency across this many loadgen "
+                         "PROCESSES. One python process saturates roughly one core "
+                         "issuing signed HTTPS requests, so past ~150 decisions/s a "
+                         "single-process harness measures itself. Use 16+ on a dedicated "
+                         "box, and prove it by doubling this at fixed --concurrency: if "
+                         "throughput moves more than noise, the client was the limit")
     ap.add_argument("--out", default="")
     args = ap.parse_args()
 
     if bool(args.endpoint) == bool(args.base):
         ap.error("pass exactly one of --endpoint (SageMaker) or --base (direct HTTP)")
-
-    rt = None
-    session = None
-    if args.endpoint:
-        # retries off, so a failure is an error rather than latency in disguise; pool well
-        # above the concurrency under test, because botocore's default of 10 would
-        # serialise everything past 10 and measure the client.
-        cfg = Config(max_pool_connections=256, retries={"max_attempts": 0},
-                     read_timeout=300, connect_timeout=30)
-        rt = boto3.client("sagemaker-runtime", region_name=args.region, config=cfg)
-    else:
-        import requests  # local-only dependency; not needed for the SageMaker path
-        session = requests.Session()
-        session.mount("http://", requests.adapters.HTTPAdapter(
-            pool_connections=256, pool_maxsize=256, max_retries=0))
+    if args.processes < 1:
+        ap.error("--processes must be at least 1")
 
     def body(ticket: str, qs: dict) -> str:
         inner = json.dumps({"state": ticket, "questions": qs})
         return json.dumps({"inputs": [{"name": "REQUEST_JSON", "shape": [1, 1],
                                        "datatype": "BYTES", "data": [inner]}]})
 
-    url = args.base.rstrip("/") + "/invocations" if args.base else ""
-
-    def invoke(payload: str):
-        t0 = time.monotonic()
-        if rt is not None:
-            r = rt.invoke_endpoint(EndpointName=args.endpoint,
-                                   ContentType="application/json", Body=payload)
-            env = json.loads(r["Body"].read().decode())
-        else:
-            resp = session.post(url, data=payload, timeout=300,
-                                headers={"Content-Type": "application/json"})
-            env = resp.json()
-        out = None
-        for o in env.get("outputs") or []:
-            if o.get("name") == "RESPONSE_JSON":
-                out = json.loads(o["data"][0])
-        if out is None or "error" in out:
-            raise RuntimeError(str(out)[:150])
-        usage = out.get("usage") or {}
-        return time.monotonic() - t0, out.get("latency_ms"), usage.get("input_tokens")
+    invoke = _make_invoke(args.endpoint, args.base, args.region)
 
     def cell(label: str, tickets: list[str], qs: dict, conc: int) -> dict:
         payloads = [body(t, qs) for t in tickets]
@@ -238,14 +377,40 @@ def main() -> int:
         server: list[float] = []
         tokens: list[int] = []
         errs: list[str] = []
-        deadline = time.monotonic() + args.seconds
-        with ThreadPoolExecutor(max_workers=conc) as ex:
-            # stride by the worker count so concurrent in-flight requests are different
-            # tickets, not the same one N times.
-            futs = [ex.submit(drive, invoke, payloads, w, max(conc, 1), deadline,
-                              lats, server, tokens, errs) for w in range(conc)]
-            for fut in futs:
-                fut.result()
+
+        shards = split_threads(conc, args.processes)
+        nproc = len(shards)
+        cpu = CpuSampler()
+        if nproc == 1:
+            deadline = time.monotonic() + args.seconds
+            with ThreadPoolExecutor(max_workers=conc) as ex:
+                # stride by the worker count so concurrent in-flight requests are different
+                # tickets, not the same one N times.
+                futs = [ex.submit(drive, invoke, payloads, w, max(conc, 1), deadline,
+                                  lats, server, tokens, errs) for w in range(conc)]
+                for fut in futs:
+                    fut.result()
+        else:
+            # Wall-clock (not monotonic) deadline, because it has to mean the same instant
+            # in every child; each child converts it back to its own monotonic clock.
+            deadline = time.time() + args.seconds
+            specs, offset = [], 0
+            for threads in shards:
+                specs.append({"endpoint": args.endpoint, "base": args.base,
+                              "region": args.region, "payloads": payloads,
+                              "threads": threads, "deadline": deadline,
+                              # Stride by the TOTAL thread count across all processes, so
+                              # the pool walk stays interleaved rather than every shard
+                              # replaying the same slice of tickets.
+                              "offset": offset, "stride": conc})
+                offset += threads
+            with ProcessPoolExecutor(max_workers=nproc) as ex:
+                for got_l, got_s, got_t, got_e in ex.map(_run_shard, specs):
+                    lats.extend(got_l)
+                    server.extend(got_s)
+                    tokens.extend(got_t)
+                    errs.extend(got_e)
+        load = cpu.read()
         n_q = len(qs)
         tickets_s = len(lats) / args.seconds
         srt = sorted(lats)
@@ -261,11 +426,12 @@ def main() -> int:
                                                          int(0.95 * len(server)))], 1)
                                  if server else None,
                "e2e_p50_ms": pct(srt, 0.50), "e2e_p95_ms": pct(srt, 0.95),
-               "input_tokens": statistics.mode(tokens) if tokens else None}
-        print("[bench] {:<22} q={:<3} c={:<3} {:>6} tick/s  {:>6} dec/s  "
-              "{:>6} ms/dec  server p50 {:>6} ms  tok {:<5} err {}".format(
-                  label, n_q, conc, row["tickets_per_s"], row["decisions_per_s"],
-                  row["ms_per_decision_gpu"], row["server_p50_ms"],
+               "input_tokens": statistics.mode(tokens) if tokens else None,
+               "processes": nproc, **load}
+        print("[bench] {:<22} q={:<3} c={:<3} p={:<3} {:>6} tick/s  {:>6} dec/s  "
+              "server p50 {:>6} ms  e2e p50 {:>7} ms  cpu {:>5}%  tok {:<5} err {}".format(
+                  label, n_q, conc, nproc, row["tickets_per_s"], row["decisions_per_s"],
+                  row["server_p50_ms"], row["e2e_p50_ms"], row["loadgen_cpu_pct"],
                   row["input_tokens"], row["errors"]), flush=True)
         return row
 
@@ -295,6 +461,7 @@ def main() -> int:
         with open(args.out, "w") as fh:
             json.dump({"rows": rows, "target": args.endpoint or args.base,
                        "ticket_mode": args.tickets,
+                       "processes": args.processes,
                        "seconds_per_cell": args.seconds}, fh, indent=2)
         print(f"\n[bench] wrote {args.out}")
     print("[bench] BENCH_FINISHED")

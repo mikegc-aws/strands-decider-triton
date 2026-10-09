@@ -54,9 +54,12 @@ from botocore.exceptions import ClientError
 # which host you get is a lottery. Rebuilding on CUDA 12 does NOT unlock it.
 #
 # When Ada capacity is short -- six consecutive InsufficientInstanceCapacity failures across
-# ml.g6.xlarge (x2), ml.g6e.xlarge, ml.g6.2xlarge and ml.g6.4xlarge, ~31 minutes each -- the
-# remedy is to run several CreateEndpoint attempts concurrently under different --name
-# values and keep whichever lands, not to fall back to g5. See README.md, "Deploy".
+# ml.g6.xlarge (x2), ml.g6e.xlarge, ml.g6.2xlarge and ml.g6.4xlarge, ~31 minutes each -- use
+# `--instance-pools`, which asks SageMaker to fall back across up to five types within ONE
+# CreateEndpoint. That supersedes the old advice here (launch several endpoints under
+# different --name values and keep whichever lands), which worked but needed a human
+# watching three deploys and left two to tear down. Do not fall back to g5: the drivers on
+# that fleet are too old for any current Triton DLC, measured twice, see above.
 DEFAULT_INSTANCE = "ml.g6.xlarge"
 
 # ---- going bigger: ml.g6e.xlarge, measured ---------------------------------------------
@@ -133,6 +136,29 @@ DEFAULT_MAX_CAPACITY = 4
 STARTUP_HEALTH_CHECK_TIMEOUT = 1800
 MODEL_DATA_DOWNLOAD_TIMEOUT = 1800
 
+# How long SageMaker may spend trying to place instances across ALL instance pools before
+# giving up. Only valid alongside `InstancePools`.
+#
+# 900 s rather than the 3600 s maximum, because the thing being bought here is a FAST
+# failure. Six consecutive `InsufficientInstanceCapacity` deploys cost ~31 minutes each
+# before surfacing -- over three hours of wall clock for zero information. Capacity that
+# has not appeared in 15 minutes across five instance types is not about to, and a deploy
+# that fails in 15 minutes can be retried or re-planned inside the same working session.
+# Valid range is 300-3600.
+PROVISION_TIMEOUT = 900
+
+# Instance pools, the fix for `InsufficientInstanceCapacity` costing half-hours.
+#
+# SageMaker accepts an ordered list of up to 5 instance types per production variant and
+# falls back automatically when the higher-priority one has no capacity, so one
+# CreateEndpoint attempt covers every type instead of one. MEASURED: one pooled attempt
+# landed an ml.g6e.4xlarge immediately after three serial single-type attempts had each
+# failed after ~31 minutes.
+#
+# Priority 1 is the HIGHEST and is tried first; scale-IN releases the lowest-priority
+# (fallback) instances first, so the preferred type is kept as long as possible.
+MAX_INSTANCE_POOLS = 5
+
 
 def _tags(extra: dict | None = None) -> list[dict]:
     tags = {"Project": "strands-decider", "ManagedBy": "decider-server/deploy"}
@@ -140,7 +166,87 @@ def _tags(extra: dict | None = None) -> list[dict]:
     return [{"Key": k, "Value": v} for k, v in tags.items()]
 
 
-def ensure_model(sm, name: str, image: str, role: str, env: dict, replace: bool) -> str:
+def parse_instance_pools(spec: str) -> list[dict]:
+    """`"ml.g6e.4xlarge,ml.g6e.2xlarge"` -> ordered `InstancePools`, priority 1 first.
+
+    Priority is taken from POSITION rather than asked for separately: the only thing
+    priority expresses is "try these in this order", and a hand-written priority column is
+    a second place for the order to disagree with itself.
+
+    Duplicates are rejected rather than de-duplicated. A repeated type does not widen the
+    search at all -- it burns one of the five pool slots on a type that already failed --
+    and the most likely way to write one is a typo in a longer list, where silently
+    accepting it would leave the operator believing they had five fallbacks instead of four.
+    """
+    types = [t.strip() for t in spec.split(",") if t.strip()]
+    if not types:
+        raise SystemExit("--instance-pools was given but lists no instance types")
+    if len(types) > MAX_INSTANCE_POOLS:
+        raise SystemExit(
+            f"--instance-pools takes at most {MAX_INSTANCE_POOLS} instance types "
+            f"(SageMaker's limit); got {len(types)}: {', '.join(types)}")
+    duplicates = sorted({t for t in types if types.count(t) > 1})
+    if duplicates:
+        raise SystemExit(
+            f"--instance-pools repeats {', '.join(duplicates)}. A duplicate pool adds no "
+            "fallback and wastes one of five slots; list each type once, in priority order.")
+    return [{"InstanceType": t, "Priority": i} for i, t in enumerate(types, start=1)]
+
+
+def instance_pools_supported() -> bool:
+    """Whether the INSTALLED botocore knows about `InstancePools`.
+
+    Checked against the service model rather than a version string, because the version
+    that introduced it is a fact about botocore's release history and this is a fact about
+    the bytes on this machine.
+
+    Worth checking at all because of the shape of the failure. botocore validates
+    parameters against its bundled service model, so an older botocore rejects the request
+    client-side with a `ParamValidationError` naming an "unknown parameter" -- which reads
+    like the feature does not exist in SageMaker rather than like the SDK is stale, and is
+    the wrong thing to conclude. Measured here: botocore 1.42.97 does not have it, 1.43.x
+    does.
+    """
+    try:
+        import botocore.session
+
+        variant = (botocore.session.get_session()
+                   .get_service_model("sagemaker")
+                   .shape_for("ProductionVariant"))
+        return "InstancePools" in variant.members
+    except Exception:
+        # Never block a deploy on a failed introspection -- fall through to letting the
+        # real API call be the judge.
+        return True
+
+
+def describe_placement(sm, name: str) -> str:
+    """Which instance type an endpoint using pools actually landed on.
+
+    The point of pools is that you do NOT know in advance, so the deploy has to report it;
+    otherwise a benchmark number gets attributed to the type that was asked for rather than
+    the one that served it. `DescribeEndpoint` returns per-pool counts once provisioned.
+    """
+    try:
+        variants = sm.describe_endpoint(EndpointName=name).get("ProductionVariants") or []
+    except ClientError as exc:
+        return f"(could not read placement: {exc.response['Error']['Code']})"
+    parts = []
+    for v in variants:
+        pools = v.get("InstancePools") or []
+        if pools:
+            landed = ", ".join(
+                f"{p.get('InstanceType')} x{p.get('CurrentInstanceCount', '?')}"
+                for p in pools if p.get("CurrentInstanceCount"))
+            parts.append(f"{v['VariantName']}: {landed or 'nothing placed yet'}")
+        else:
+            parts.append(f"{v['VariantName']}: {v.get('CurrentInstanceType') or '?'} "
+                         f"x{v.get('CurrentInstanceCount', '?')}")
+    return "; ".join(parts) or "(no variants reported)"
+
+
+def ensure_model(sm, name: str, image: str, role: str, env: dict, replace: bool,
+                 model_data_url: str = "") -> str:
     try:
         sm.describe_model(ModelName=name)
         if not replace:
@@ -153,21 +259,67 @@ def ensure_model(sm, name: str, image: str, role: str, env: dict, replace: bool)
             raise
 
     print(f"[model] creating {name}")
+    container = {"Image": image, "Environment": env}
+    if model_data_url:
+        # A MODEL REPOSITORY OVERLAY, not weights.
+        #
+        # Normally there is no ModelDataUrl at all: the weights are baked into the image, so
+        # there is no 4.6 GB S3 download on every scale-out.
+        #
+        # What this is for is tuning `config.pbtxt` without a ~25-minute image rebuild.
+        # SageMaker untars the archive over /opt/ml/model, which is exactly where
+        # Dockerfile.triton puts the model repository (the DLC hard-codes
+        # SAGEMAKER_SINGLE_MODEL_REPO=/opt/ml/model/), so the archive's `decider/` replaces
+        # the image's.
+        #
+        # THE TRAP, because it cost a deploy: it replaces the model repository, which means
+        # it replaces `decider/1/model.py` too -- so the archive must contain a model.py,
+        # and that model.py then runs against whatever `strands_decider` the IMAGE was built
+        # with. A newer model.py passing a newer kwarg dies with
+        #   TypeError: load_merged_engine() got an unexpected keyword argument
+        # and the endpoint fails on the ping health check ~31 minutes later. This is why
+        # `model.py::_engine_kwargs` filters optional kwargs against the real signature.
+        # Build the archive with `tools/make_overlay.py`, which checks both of these.
+        container["ModelDataUrl"] = model_data_url
+        print(f"[model] model repository overlay: {model_data_url}")
     sm.create_model(
         ModelName=name,
         ExecutionRoleArn=role,
-        # No ModelDataUrl: the weights are baked into the image, so there is no 4.6 GB S3
-        # download on every scale-out. If you do supply one, SageMaker untars it to
-        # /opt/ml/model and the entrypoint prefers it -- but the archive must have
-        # strands_decider_config.json (or hobson_config.json) at its ROOT, not nested.
-        PrimaryContainer={"Image": image, "Environment": env},
+        PrimaryContainer=container,
         Tags=_tags(),
     )
     return name
 
 
+def production_variant(model_name: str, instance: str, variant: str,
+                       pools: list[dict] | None) -> dict:
+    """The variant body, with `InstancePools` REPLACING `InstanceType` when pools are used.
+
+    Replacing, not accompanying: the API treats them as alternatives ("you replace the
+    InstanceType parameter in your production variant with an InstancePools list"), and
+    sending both is a validation error rather than a helpful hint about which to prefer.
+    Built as a separate pure function so a test can assert that, without an account.
+    """
+    body = {
+        "VariantName": variant,
+        "ModelName": model_name,
+        "InitialInstanceCount": DEFAULT_MIN_CAPACITY,
+        # Weight matters only once there is a second variant for an A/B.
+        "InitialVariantWeight": 1.0,
+        "ContainerStartupHealthCheckTimeoutInSeconds": STARTUP_HEALTH_CHECK_TIMEOUT,
+        "ModelDataDownloadTimeoutInSeconds": MODEL_DATA_DOWNLOAD_TIMEOUT,
+    }
+    if pools:
+        body["InstancePools"] = pools
+        body["VariantInstanceProvisionTimeoutInSeconds"] = PROVISION_TIMEOUT
+    else:
+        body["InstanceType"] = instance
+    return body
+
+
 def ensure_endpoint_config(sm, name: str, model_name: str, instance: str,
-                           variant: str, replace: bool) -> str:
+                           variant: str, replace: bool,
+                           pools: list[dict] | None = None) -> str:
     try:
         sm.describe_endpoint_config(EndpointConfigName=name)
         if not replace:
@@ -179,19 +331,15 @@ def ensure_endpoint_config(sm, name: str, model_name: str, instance: str,
         if exc.response["Error"]["Code"] not in ("ValidationException", "ResourceNotFound"):
             raise
 
-    print(f"[config] creating {name} ({instance})")
+    if pools:
+        shown = " -> ".join(f"{p['InstanceType']}(p{p['Priority']})" for p in pools)
+        print(f"[config] creating {name} (pools: {shown}, "
+              f"provision timeout {PROVISION_TIMEOUT}s)")
+    else:
+        print(f"[config] creating {name} ({instance})")
     sm.create_endpoint_config(
         EndpointConfigName=name,
-        ProductionVariants=[{
-            "VariantName": variant,
-            "ModelName": model_name,
-            "InitialInstanceCount": DEFAULT_MIN_CAPACITY,
-            "InstanceType": instance,
-            # Weight matters only once there is a second variant for an A/B.
-            "InitialVariantWeight": 1.0,
-            "ContainerStartupHealthCheckTimeoutInSeconds": STARTUP_HEALTH_CHECK_TIMEOUT,
-            "ModelDataDownloadTimeoutInSeconds": MODEL_DATA_DOWNLOAD_TIMEOUT,
-        }],
+        ProductionVariants=[production_variant(model_name, instance, variant, pools)],
         Tags=_tags(),
     )
     return name
@@ -216,6 +364,19 @@ def ensure_endpoint(sm, name: str, config: str) -> None:
       * present but Creating/Updating  -> refuse. SageMaker returns "Cannot update
                                           in-progress endpoint"; say so plainly rather than
                                           turning it into a confusing create attempt.
+
+    CAVEAT ON THE `UpdateEndpoint` ARM, which is live here and does not work on `ml.g6e`.
+    `UpdateEndpoint` is a blue/green move: SageMaker brings up the new fleet BEFORE taking
+    the old one down, so it needs `2 x InitialInstanceCount` of the instance type at once.
+    The endpoint-usage quota for every `ml.g6e` size in this account is **1**, so the
+    update is refused for want of capacity and the endpoint keeps serving the old config --
+    i.e. it looks like the deploy did nothing. Delete-and-recreate is the only path on g6e
+    today, which is why a `config.pbtxt` sweep costs a full teardown per cell.
+
+    A quota bump to 2 would unblock it, and is the single cheapest unblock available here:
+    it converts every configuration change from (delete, wait, create, wait) into one
+    in-place update, and it is also what autoscaling needs to be more than decorative
+    (see `resolve_max_capacity`).
     """
     try:
         current = sm.describe_endpoint(EndpointName=name)
@@ -298,6 +459,43 @@ def endpoint_usage_quota(region: str, instance_type: str) -> float | None:
         return None
     print(f"[quota] no quota named {want!r} found")
     return None
+
+
+def resolve_pooled_max_capacity(region: str, pools: list[dict], requested: int) -> int:
+    """The autoscaling ceiling for a variant that may land on any of several types.
+
+    Takes the BEST (largest) quota across the pools rather than the worst or the sum.
+
+      * Not the sum: the quotas are per type and a single variant's instances are not
+        guaranteed to spread across types, so the sum is a ceiling that may not exist.
+      * Not the minimum: that would clamp to the worst fallback and refuse to use headroom
+        the preferred type actually has.
+
+    The best is still only an upper bound -- the real ceiling depends on which pool the
+    fleet landed in, which is knowable only after the fact (`describe_placement`). Every
+    pool's quota is printed so the spread is visible rather than summarised away.
+    """
+    best, quotas = 0, []
+    for pool in pools:
+        itype = pool["InstanceType"]
+        quota = endpoint_usage_quota(region, itype)
+        quotas.append(f"{itype}={'?' if quota is None else int(quota)}")
+        if quota is not None:
+            best = max(best, int(quota))
+    print(f"[quota] endpoint-usage quota per pool: {', '.join(quotas)}")
+    if best <= 0:
+        # Unreadable everywhere -> do not block the deploy; the pooled create will be the
+        # judge. Unlike the single-type path there is no one type to refuse on behalf of.
+        return requested
+    if requested > best:
+        print(f"[quota] best pooled quota is {best}; clamping --max-capacity from "
+              f"{requested} to {best}")
+        if best == 1:
+            print("[quota] NOTE: a maximum of 1 means autoscaling cannot add an instance, "
+                  "and it also means UpdateEndpoint cannot move this endpoint to a new "
+                  "config (blue/green needs 2x). Delete-and-recreate is the only path.")
+        return best
+    return requested
 
 
 def resolve_max_capacity(region: str, instance_type: str, requested: int) -> int:
@@ -411,11 +609,33 @@ def delete_all(sm, region: str, endpoint: str, config: str, model: str, variant:
     except ClientError as exc:
         print(f"[config] list failed: {exc.response['Error']['Code']} (ignoring)")
 
+    # Models are swept by prefix for the same reason configs are: `--model-data-url`
+    # appends an overlay hash to the model name, so a sweep that ran several overlays has
+    # several models and `--delete` is usually invoked WITHOUT the overlay argument. Deleting
+    # only the one name computed from this invocation's flags would leave the rest behind.
+    #
+    # `NameContains` is a substring match, so the exact name is deleted first and then the
+    # prefix sweep picks up `<model>-<hash>` siblings. Narrow by design: it matches this
+    # deployment's own model name, not a bare project prefix that could reach a neighbour's
+    # resources.
     try:
         sm.delete_model(ModelName=model)
-        print("[model] deleted")
+        print(f"[model] deleted {model}")
     except ClientError as exc:
         print(f"[model] {exc.response['Error']['Code']} (ignoring)")
+    base_model = model.split("-model", 1)[0] + "-model"
+    try:
+        for item in sm.list_models(NameContains=base_model,
+                                   MaxResults=100).get("Models", []):
+            if not item["ModelName"].startswith(base_model):
+                continue
+            try:
+                sm.delete_model(ModelName=item["ModelName"])
+                print(f"[model] deleted {item['ModelName']}")
+            except ClientError as exc:
+                print(f"[model] {exc.response['Error']['Code']} (ignoring)")
+    except ClientError as exc:
+        print(f"[model] list failed: {exc.response['Error']['Code']} (ignoring)")
 
 
 def main() -> int:
@@ -426,6 +646,16 @@ def main() -> int:
     ap.add_argument("--name", default="strands-decider", help="base name for all resources")
     ap.add_argument("--region", default="us-west-2")
     ap.add_argument("--instance-type", default=DEFAULT_INSTANCE)
+    ap.add_argument("--instance-pools", default="",
+                    help="comma-separated instance types in priority order, e.g. "
+                         "'ml.g6e.4xlarge,ml.g6e.2xlarge,ml.g6e.xlarge'. SageMaker falls "
+                         "back automatically on InsufficientInstanceCapacity instead of "
+                         "failing after ~31 minutes. Max 5; overrides --instance-type")
+    ap.add_argument("--model-data-url", default="",
+                    help="S3 URI of a model-repository overlay tarball (built by "
+                         "tools/make_overlay.py). Tunes config.pbtxt with no image "
+                         "rebuild. Must contain decider/1/model.py as well as "
+                         "decider/config.pbtxt -- it REPLACES /opt/ml/model")
     ap.add_argument("--variant", default="AllTraffic")
     ap.add_argument("--min-capacity", type=int, default=DEFAULT_MIN_CAPACITY)
     ap.add_argument("--max-capacity", type=int, default=DEFAULT_MAX_CAPACITY)
@@ -442,8 +672,26 @@ def main() -> int:
     args = ap.parse_args()
 
     sm = boto3.client("sagemaker", region_name=args.region)
-    model_name = f"{args.name}-model"
     endpoint_name = args.name
+
+    pools = parse_instance_pools(args.instance_pools) if args.instance_pools else None
+    if pools and not instance_pools_supported():
+        raise SystemExit(
+            "--instance-pools needs a botocore that knows the InstancePools parameter "
+            "(1.43.0 or later; this one does not have it). botocore validates against its "
+            "bundled service model, so the request would be refused client-side with a "
+            "misleading 'unknown parameter' error rather than by SageMaker. Upgrade with "
+            "`pip install -U botocore boto3`, or drop --instance-pools.")
+
+    # The model name carries a hash of the OVERLAY, when there is one, for exactly the
+    # reason `cfg_fingerprint` below hashes the config: `ModelDataUrl` lives on the model,
+    # `ensure_model` reuses an existing model by name, and a sweep that points the same
+    # model name at a new overlay would therefore reuse the OLD overlay and report success.
+    # That is the same silent "deploy did nothing" failure, one object along.
+    model_name = f"{args.name}-model"
+    if args.model_data_url:
+        overlay_tag = hashlib.sha256(args.model_data_url.encode()).hexdigest()[:10]
+        model_name = f"{model_name}-{overlay_tag}"
 
     # The endpoint config name carries a hash of what it configures, so changing the
     # image (or instance type, or env) produces a NEW name.
@@ -461,7 +709,11 @@ def main() -> int:
     # Old configs are left behind deliberately: they cost nothing, and keeping them means
     # a rollback is `--image <previous>`, which resolves to a config that already exists.
     cfg_fingerprint = hashlib.sha256(
-        json.dumps([args.image, args.instance_type, args.variant, args.engine],
+        json.dumps([args.image, args.instance_type, args.variant, args.engine,
+                    # Both of these change what gets served, so both must change the name.
+                    # The pool list is ordered, and the order IS the priority, so
+                    # reordering it is a different configuration and must not collide.
+                    pools, args.model_data_url],
                    sort_keys=True).encode()).hexdigest()[:10]
     config_name = f"{args.name}-config-{cfg_fingerprint}"
 
@@ -497,9 +749,10 @@ def main() -> int:
         "SD_PREFIX_CACHE": "1",
     }
 
-    ensure_model(sm, model_name, args.image, role, env, args.replace)
+    ensure_model(sm, model_name, args.image, role, env, args.replace,
+                 model_data_url=args.model_data_url)
     ensure_endpoint_config(sm, config_name, model_name, args.instance_type,
-                           args.variant, args.replace)
+                           args.variant, args.replace, pools=pools)
     ensure_endpoint(sm, endpoint_name, config_name)
 
     if args.no_wait:
@@ -511,9 +764,15 @@ def main() -> int:
     if status != "InService":
         return 1
 
+    if pools:
+        # Which type actually served matters for every number measured against it.
+        print(f"[endpoint] placed on {describe_placement(sm, endpoint_name)}")
+
     if args.target_invocations > 0:
-        max_capacity = resolve_max_capacity(args.region, args.instance_type,
-                                            args.max_capacity)
+        max_capacity = (resolve_pooled_max_capacity(args.region, pools, args.max_capacity)
+                        if pools else
+                        resolve_max_capacity(args.region, args.instance_type,
+                                             args.max_capacity))
         configure_autoscaling(args.region, endpoint_name, args.variant,
                               args.min_capacity, max_capacity,
                               args.target_invocations)

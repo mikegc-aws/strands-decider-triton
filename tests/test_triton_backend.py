@@ -404,3 +404,66 @@ def test_shared_state_tokens_are_not_charged_to_every_caller(per_request_model):
     responses = per_request_model.execute(reqs)
     total = sum(r.body()["usage"]["input_tokens"] for r in responses)
     assert total <= 300, f"group encoded 300 tokens but reported {total}"
+
+
+# ------------------------------------------------- version tolerance of the engine loader
+#
+# These cover `_engine_kwargs`, which exists because of a specific, expensive failure: a
+# SageMaker `ModelDataUrl` overlay puts this model.py in front of whatever
+# `strands_decider` the IMAGE was built with, and the newest published image
+# (v23-triton-onepass) predates `fuse_layers`, `cuda_graphs` and `max_rows`. Passing one of
+# those blind raises `TypeError: load_merged_engine() got an unexpected keyword argument`
+# inside `initialize()`, after which Triton never reports ready and SageMaker fails the
+# endpoint ~31 MINUTES later on the ping health check. That happened once and cost a deploy.
+#
+# The asymmetry is the whole design and each half is asserted below: an option still at its
+# default may be DROPPED (nothing was asked for), but an option explicitly turned on must
+# RAISE (serving the un-fused torso after being asked for the fused one would make a
+# benchmark comparison a lie).
+
+
+def _old_loader(checkpoint, merged, *, device="cuda", use_prefix_cache=True,
+                max_batch=32, model_name="x"):
+    """A `load_merged_engine` from before any of the optional kwargs existed."""
+
+
+def _new_loader(checkpoint, merged, *, device="cuda", use_prefix_cache=True,
+                max_batch=32, model_name="x", fuse_layers=False, cuda_graphs=False,
+                cuda_graphs_two_pass=False, max_rows=128):
+    """Today's signature."""
+
+
+def test_supported_kwargs_are_passed_through(batched_model):
+    keep = batched_model._engine_kwargs(_new_loader, {
+        "fuse_layers": (True, False), "max_rows": (256, 128)})
+    assert keep == {"fuse_layers": True, "max_rows": 256}
+
+
+def test_defaulted_kwargs_are_dropped_against_an_older_engine(batched_model):
+    """The no-op case. Nothing was requested, so an engine that cannot do it is already
+    doing what the caller wanted -- and dropping is what keeps an overlay deployable."""
+    keep = batched_model._engine_kwargs(_old_loader, {
+        "fuse_layers": (False, False), "cuda_graphs": (False, False),
+        "max_rows": (128, 128)})
+    assert keep == {}
+
+
+def test_explicitly_enabled_kwarg_is_refused_rather_than_ignored(batched_model):
+    """The load-bearing half. `SD_MAX_ROWS=256` against an engine pinned at 128 must fail
+    the load, not serve 128 quietly -- otherwise the throughput number gets attributed to a
+    row budget that was never in effect."""
+    pb = sys.modules["triton_python_backend_utils"]
+    with pytest.raises(pb.TritonModelException) as exc:
+        batched_model._engine_kwargs(_old_loader, {"max_rows": (256, 128)})
+    assert "max_rows=256" in str(exc.value)
+    # The message must name the cause, because the reader is looking at a failed endpoint.
+    assert "overlay" in str(exc.value).lower()
+
+
+def test_refusal_mentions_every_unsupported_request(batched_model):
+    pb = sys.modules["triton_python_backend_utils"]
+    with pytest.raises(pb.TritonModelException) as exc:
+        batched_model._engine_kwargs(_old_loader, {
+            "fuse_layers": (True, False), "max_rows": (256, 128)})
+    assert "fuse_layers=True" in str(exc.value)
+    assert "max_rows=256" in str(exc.value)
