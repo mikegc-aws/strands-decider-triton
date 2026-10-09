@@ -502,9 +502,27 @@ utilisation (100% against 85%) while delivering 10% *less* work. That is content
 overlap — and it is why "GPU util is high" is not evidence that a GPU is the bottleneck on
 this model.
 
-**Revisit it only with more vCPU**, and only together with `max_batch_size`, so that
-`count × max_batch_size × questions` still lands at or just under `max_rows`.
-`ml.g6.2xlarge` (8 vCPU, same L4, ~8% more money) is the cheap place to retest.
+**Retested with more vCPU, and the penalty was the batch geometry, not the CPU.** On a
+64-vCPU host (`ml.g6.16xlarge`, same single L4), holding `count × max_batch_size × 7 = 56`
+rows constant:
+
+| `count` | `max_batch_size` | peak decisions/s | server p50 |
+| --- | --- | --- | --- |
+| 1 | 8 | 103.8 | 618 ms |
+| 2 | 4 | 103.1 | 601 ms |
+| 4 | 2 | 95.2 | 665 ms |
+
+So `count: 2` with `max_batch_size` moved to match is **completely neutral** — the 10%
+loss and doubled p50 seen at `count: 2, mbs: 8` were the halved batch, and removing the
+geometry change removes the whole penalty. The batch-splitting mechanism above is
+confirmed; the 4-vCPU contention story cannot be separated out and may have contributed.
+
+But `count: 4` still loses ~8% with rows held constant, which sharpens the rule: what
+matters is rows **per pass**, not rows in total. Four passes of 14 rows pay the fixed
+per-pass cost four times and no amount of vCPU fixes that. So keeping
+`count × max_batch_size × questions` at `max_rows` is **necessary but not sufficient** —
+dropping `max_batch_size` below ~8 is itself the harm. `count: 1` stays the default;
+`count: 2` is a free no-op rather than a win.
 
 ## Known limits
 
@@ -597,10 +615,23 @@ this model.
   less arithmetic and move less data but carry more Python per op, so they help a full pass
   (1.07-1.42x at 56 rows) and *hurt* a small one (0.85x at batch 1). Choose for the regime
   you are in.
-- **`instance_group count: 2` is now measured and is worse** (91.4 decisions/s against
-  101.5, with p50 doubling). More GPU-side parallelism is not the lever on a 4-vCPU host --
-  see [above](#instance_group-count-measured-1-wins). The remaining levers all attack the
-  dispatch floor itself, or buy more vCPU to issue it with.
+- **`instance_group count: 2` is measured and buys nothing.** It is neutral when
+  `max_batch_size` moves with it and 10% worse when it does not; `count: 4` loses ~8% even
+  with rows held constant. See [above](#instance_group-count-measured-1-wins).
+- **More vCPU does not help, and this is measured, not assumed.** On a fixed single L4,
+  throughput is flat across a **16x** span of vCPU: **101.5 → 102.9 → 103.8 decisions/s at
+  4 → 32 → 64 vCPU**, and equally flat at concurrency 1 (63.4 → 64.4 → 62.9) with the
+  single-pass floor unmoved at 45 → 43 → 45 ms. The reason is in the sentence above: the
+  ~5,676 launches are issued **single-threaded per stub**, and a serial instruction stream
+  does not go faster on more cores. Extra vCPU can only relieve *contention* between stubs,
+  `tritonserver` and a co-resident load generator — so it buys nothing once the load
+  generator is on its own host. An earlier version of this section suggested buying vCPU to
+  issue the dispatch stream faster; that was wrong.
+
+  It is worse than neutral on cost, because price is not flat: **$/1,000 tickets degrades
+  3.7x, $0.022 → $0.080**, from 4 to 64 vCPU. **On a fixed GPU, buy the smallest vCPU count
+  that fits.** The levers that remain all attack the dispatch floor itself (`SD_CUDA_GRAPHS`)
+  or the GPU work (`SD_FUSE_LAYERS`, a faster card).
 - A single question costs almost as much as three, for the same reason: you are paying for
   the pass, not the work.
 - Text only. Images are rejected; the vision path needs a different torso.
