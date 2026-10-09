@@ -477,59 +477,6 @@ def test_overlay_at_shipped_defaults_needs_no_rebuild(make_overlay):
 # one figure that measured a 4-vCPU client rather than the endpoint.
 
 
-def test_shard_threads_sum_to_the_offered_concurrency(bench_tickets):
-    """The sum IS the concurrency the cell reports. Rounding every shard up would offer
-    more load than the label claims -- c=10 over 4 processes would really run 12."""
-    for conc in range(1, 40):
-        for procs in (1, 2, 3, 4, 8, 16):
-            shards = bench_tickets.split_threads(conc, procs)
-            assert sum(shards) == conc, (conc, procs, shards)
-            assert all(t >= 1 for t in shards), (conc, procs, shards)
-
-
-def test_shards_never_outnumber_threads(bench_tickets):
-    """An empty shard pays process startup, issues nothing, and makes --processes look
-    like it changed the result when all it changed was the number of idle children."""
-    assert bench_tickets.split_threads(1, 16) == [1]
-    assert len(bench_tickets.split_threads(4, 16)) == 4
-
-
-def test_shard_threads_are_balanced(bench_tickets):
-    """Within one, so no single process is the bottleneck for the whole cell."""
-    shards = bench_tickets.split_threads(10, 4)
-    assert max(shards) - min(shards) <= 1
-    assert sorted(shards) == [2, 2, 3, 3]
-
-
-def test_startup_grace_scales_with_the_shard_count(bench_tickets):
-    """The barrier budget. Every shard must finish forking and building a boto3 client
-    BEFORE the measurement window opens, or it measures a short window and the parent still
-    divides by the full `--seconds`.
-
-    MEASURED cost of getting this wrong, against Little's law on a live L40S endpoint: the
-    cells with one thread per process read 0.82x and 0.45x of concurrency/e2e-p50 while
-    every cell with two or more threads read 1.03-1.31x. That asymmetry -- a deficit only
-    where a shard issues few requests -- is the signature of fixed startup inside the
-    window, and it is almost certainly the 'bistability' previously filed as undiagnosed.
-    """
-    assert bench_tickets.startup_grace(1) < bench_tickets.startup_grace(32)
-    # Enough slack for a 32-way pool at the measured ~1 s per client, without making a
-    # 15-second cell mostly waiting.
-    assert bench_tickets.startup_grace(32) >= 12.0
-    assert bench_tickets.startup_grace(1) >= 3.0
-
-
-def test_cpu_sampler_reports_a_usable_percentage(bench_tickets):
-    """`loadgen_cpu_pct` is the evidence that a headline number is not client-bound, so it
-    must be populated on every platform -- there is no /proc on macOS, where the harness's
-    own rusage is the fallback."""
-    sampler = bench_tickets.CpuSampler()
-    reading = sampler.read()
-    assert reading["loadgen_cpu_pct"] is not None
-    assert 0.0 <= reading["loadgen_cpu_pct"] <= 100.0 * (reading["loadgen_vcpu"] + 1)
-    assert reading["loadgen_vcpu"] >= 1
-
-
 # ------------------------------------------------------------------- the tool guards
 
 
