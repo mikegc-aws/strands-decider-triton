@@ -68,6 +68,9 @@ ECR_READ_POLICY = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
 # scoped to the SageMaker log group prefix instead of CloudWatchLogsFullAccess.
 OBSERVABILITY_POLICY_NAME = "strands-decider-logs-and-metrics"
 
+# Read a model-repository overlay from S3. Attached only when there IS one.
+OVERLAY_POLICY_NAME = "strands-decider-overlay-read"
+
 
 def trust_policy(account: str) -> dict:
     """Let SageMaker assume the role, and only on behalf of this account.
@@ -118,7 +121,42 @@ def observability_policy(region: str, account: str) -> dict:
     }
 
 
-def ensure_execution_role(region: str, account: str, name: str) -> str:
+def overlay_read_policy(bucket: str, prefix: str = "decider-overlays") -> dict:
+    """Read a `--model-data-url` overlay tarball, and nothing else.
+
+    Needed because the normal deployment has NO `ModelDataUrl` -- the weights are in the
+    image -- so the base role deliberately grants no S3 at all. A `config.pbtxt` overlay
+    changes that: SageMaker fetches the archive using the EXECUTION role, and without this
+    the endpoint fails with
+        ValidationException: Could not access model data at s3://... validate that the role
+    which names the role rather than the missing action and so reads like a trust-policy
+    problem.
+
+    Scoped to one bucket and one prefix, with `ListBucket` conditioned on the same prefix.
+    `GetObject` on `bucket/prefix/*` is NOT the same grant as on `bucket` -- the object
+    actions need the key wildcard and `ListBucket` needs the bucket ARN itself, which is
+    the single most common way this policy is written wrong and silently too broad.
+    """
+    return {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Action": ["s3:GetObject", "s3:GetObjectVersion"],
+                "Resource": f"arn:aws:s3:::{bucket}/{prefix}/*",
+            },
+            {
+                "Effect": "Allow",
+                "Action": "s3:ListBucket",
+                "Resource": f"arn:aws:s3:::{bucket}",
+                "Condition": {"StringLike": {"s3:prefix": f"{prefix}/*"}},
+            },
+        ],
+    }
+
+
+def ensure_execution_role(region: str, account: str, name: str,
+                          overlay_bucket: str = "") -> str:
     """Create or reuse the SageMaker execution role, and return its ARN.
 
     The sleep at the end is not superstition. IAM is eventually consistent across its own
@@ -156,8 +194,15 @@ def ensure_execution_role(region: str, account: str, name: str) -> str:
         PolicyName=OBSERVABILITY_POLICY_NAME,
         PolicyDocument=json.dumps(observability_policy(region, account)),
     )
-    print(f"[role] policies in place ({Path(ECR_READ_POLICY).name}, "
-          f"{OBSERVABILITY_POLICY_NAME})")
+    attached = [Path(ECR_READ_POLICY).name, OBSERVABILITY_POLICY_NAME]
+    if overlay_bucket:
+        iam.put_role_policy(
+            RoleName=name,
+            PolicyName=OVERLAY_POLICY_NAME,
+            PolicyDocument=json.dumps(overlay_read_policy(overlay_bucket)),
+        )
+        attached.append(OVERLAY_POLICY_NAME)
+    print(f"[role] policies in place ({', '.join(attached)})")
 
     if created:
         print("[role] waiting 15s for IAM propagation before SageMaker uses it")
@@ -300,6 +345,11 @@ def main() -> int:
     ap.add_argument("--role", default="",
                     help="an existing execution role ARN; one is created if omitted")
     ap.add_argument("--role-name", default=DEFAULT_ROLE_NAME)
+    ap.add_argument("--overlay-bucket", default="",
+                    help="grant the execution role read on this bucket's "
+                         "decider-overlays/ prefix, for create_endpoint.py "
+                         "--model-data-url. Omitted by default: the normal deployment has "
+                         "no ModelDataUrl, so the role needs no S3 at all")
     ap.add_argument("--target-invocations", type=float, default=0.0,
                     help="invocations/instance/MINUTE for autoscaling; 0 disables it. See "
                          "create_endpoint.py for how to pick this from the measured ceiling")
@@ -354,7 +404,8 @@ def main() -> int:
             env={"BOX_ID": args.box_id, "REGION": args.region,
                  "BUCKET": bucket, "REPO": args.repo})
 
-    role = args.role or ensure_execution_role(args.region, account, args.role_name)
+    role = args.role or ensure_execution_role(args.region, account, args.role_name,
+                                              overlay_bucket=args.overlay_bucket)
 
     endpoint_cmd = [sys.executable, str(HERE / "create_endpoint.py"),
                     "--image", image, "--role", role, "--name", args.name,

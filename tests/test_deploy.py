@@ -141,6 +141,28 @@ def test_zero_quota_refuses_rather_than_deploying_something_unplaceable(
         create_endpoint.resolve_max_capacity("us-west-2", "ml.g6.24xlarge", 4)
 
 
+def test_overlay_policy_separates_object_and_bucket_grants(up):
+    """`bucket/prefix/*` and `bucket` are different ARNs for different actions, and
+    conflating them is the usual way this policy ends up either broken or far too broad.
+    GetObject needs the key wildcard; ListBucket needs the bucket itself."""
+    policy = up.overlay_read_policy("my-bucket")
+    objects = [s for s in policy["Statement"] if "s3:GetObject" in s["Action"]]
+    assert objects[0]["Resource"] == "arn:aws:s3:::my-bucket/decider-overlays/*"
+    listing = [s for s in policy["Statement"] if s["Action"] == "s3:ListBucket"]
+    assert listing[0]["Resource"] == "arn:aws:s3:::my-bucket"
+    assert listing[0]["Condition"]["StringLike"]["s3:prefix"] == "decider-overlays/*"
+
+
+def test_overlay_policy_grants_no_write_and_no_wildcard_bucket(up):
+    """The role only ever reads an overlay. A write grant would let a compromised endpoint
+    replace the model configuration it is about to load."""
+    policy = up.overlay_read_policy("my-bucket")
+    actions = {a for s in policy["Statement"] for a in
+               ([s["Action"]] if isinstance(s["Action"], str) else s["Action"])}
+    assert not {a for a in actions if "Put" in a or "Delete" in a}
+    assert "arn:aws:s3:::*" not in str(policy)
+
+
 # --------------------------------------------------------------------- instance pools
 #
 # The point of pools is that six consecutive `InsufficientInstanceCapacity` deploys cost
