@@ -19,7 +19,7 @@ Five terms do all the work. Everything else follows from them.
 | term | plain meaning |
 | --- | --- |
 | **forward pass** | One trip of some text through the model's weights. The unit of work and the unit of cost. Think "one query against a database that has no index": you pay for the trip, not for the row you wanted. |
-| **state** | The document, ticket, email or transcript being asked about. Usually the long part. |
+| **state** | Whatever is being judged: a document, email, pull request, contract clause, transcript, or a JSON record. Usually the long part. |
 | **question** | One typed question plus its option list. Usually the short part — a few dozen tokens. |
 | **row** | One (state, question) pair as the model sees it. A request with 7 questions is 7 rows. |
 | **cache** | What the model remembers about text it has already read, so it does not have to re-read it. Encode a state once, keep the cache, and a question can be appended for the price of the question alone. |
@@ -41,7 +41,7 @@ cost of one forward pass  =  max( 45 ms ,  tokens × 0.0935 ms )
 
 The 45 ms floor is not arithmetic. It is the CPU issuing ~5,676 individual instructions to
 the GPU and waiting. (For scale: physically streaming the model's 3.8 GB of weights
-through the card's memory bandwidth accounts for only 12.7 ms of it.) At realistic ticket
+through the card's memory bandwidth accounts for only 12.7 ms of it.) At realistic request
 sizes — a few hundred tokens — **you are paying for the trip, not the cargo.**
 
 So the entire serving problem is:
@@ -59,7 +59,7 @@ another parcel is waiting at the depot.
    (one request, many questions)          ~free: 1 question 47 ms, 7 questions 67 ms
 
 2. Requests arriving at the same time  →  put them in the same pass
-   (many requests in flight)              8 tickets: 16 passes → 2 passes
+   (many requests in flight)              8 requests: 16 passes → 2 passes
 
 3. Requests sharing a state            →  encode that state once for all of them
    (two question sets, one document)      de-duplicated by token ids
@@ -82,7 +82,7 @@ this engine :  state + N × question                                            
 
 This is why **long documents are this deployment's strength rather than its weakness**.
 Nearly doubling the input (601 → 1,025 tokens) costs about 14% of throughput, because the
-document is paid for once per ticket instead of once per question.
+document is paid for once per request instead of once per question.
 
 ### The one-pass / two-pass decision
 
@@ -404,7 +404,7 @@ to the basic server does not help; the queue exists precisely to serialise it.
 With cross-request batching:
 
 ```
-8 tickets × 7 questions, ~90-token states, same token count both ways
+8 requests × 7 questions, ~90-token states, same token count both ways
 
    per-request (basic)   16 passes   ~790 ms   (measured)
    per-batch   (this)     2 passes   ~434 ms
@@ -412,14 +412,14 @@ With cross-request batching:
 The entire saving is passes, not arithmetic.
 ```
 
-End to end on the live endpoint: **~99 decisions/s** (~14 tickets/s, ~36,000 tickets/hour) at
-about **$0.022 per 1,000 tickets**, with a 7-question ticket at **67 ms** server-side.
+End to end on the live endpoint: **~99 decisions/s** (~14 requests/s, ~36,000 requests/hour) at
+about **$0.022 per 1,000 requests**, with a 7-question request at **67 ms** server-side.
 
 ### So which should you use?
 
 | use | because |
 | --- | --- |
-| **this deployable** for concurrent traffic on SageMaker | many callers, overlapping tickets — the batcher has something to batch, and the per-pass floor gets spread across it. Experimental: see the warning at the top of [README.md](README.md) before putting anything you care about through it |
+| **this deployable** for concurrent traffic on SageMaker | many callers, overlapping requests — the batcher has something to batch, and the per-pass floor gets spread across it. Experimental: see the warning at the top of [README.md](README.md) before putting anything you care about through it |
 | **the basic server** for local development, a laptop, MPS or CPU, CI, or a single-caller batch job | no Triton, no image build, no AWS; at concurrency 1 the two are within a few ms of each other, because with one request in flight there is nothing to coalesce |
 
 The second row is the honest caveat: **at concurrency 1 this deployment buys you almost
@@ -460,7 +460,7 @@ assemble a big batch and then split it anyway. That is measurable: raising
 
 `instance_group count` was the obvious next lever and the interesting thing is *why* it
 failed, because the reason generalises. Measured on `ml.g6.xlarge`, 7 questions, distinct
-tickets, at c=32:
+requests, at c=32:
 
 ```
 count   decisions/s   p50       GPU util (mean/median)   GPU memory
@@ -531,7 +531,7 @@ Stated plainly so you do not discover it in production:
 - **Latency numbers from a load generator on this box are not trustworthy.** A `g6.xlarge`
   has 4 vCPUs, so a co-resident `bench_tickets.py` competes with the server for the exact
   resource a dispatch-bound model is short of; the same cell measured 0.67 and 10.87
-  tickets/s on two runs an hour apart. Drive load from a separate in-region host, or measure
+  requests/s on two runs an hour apart. Drive load from a separate in-region host, or measure
   the engine in-process (`tools/fused_ab.py --batch-time`) where there is no client at all.
 - **CUDA graph capture closes the dispatch floor for the one-pass route, and is opt-in**
   (`SD_CUDA_GRAPHS=1`, off by default): a one-question request goes 45.9 ms → 21.5 ms
@@ -546,7 +546,7 @@ Stated plainly so you do not discover it in production:
   implemented but measured slower and left off; see README "Known limits".
 - **A single question costs almost as much as three.** Same reason: you are paying for the
   pass, not the work.
-- **Under load, latency becomes queueing.** At 32 requests in flight a 7-question ticket sits
+- **Under load, latency becomes queueing.** At 32 requests in flight a 7-question request sits
   at ~615 ms p50. Autoscaling exists to keep you off that; point it at a target well below
   the measured ceiling so a second instance comes up while p50 is still healthy.
 - **Cold start is minutes, not seconds** (~12 min to `InService`, dominated by the 20.6 GB

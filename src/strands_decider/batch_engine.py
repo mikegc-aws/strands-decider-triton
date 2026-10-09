@@ -14,10 +14,10 @@ Python loop (`model.py`, "one engine call per distinct state"), so with B reques
 flight we paid the per-pass cost 2B times instead of twice. Measured on an L4, one forward
 pass costs `max(45 ms, tokens x 0.0935 ms)` -- a ~45 ms floor that is CPU dispatch, not
 arithmetic (~5,676 kernel launches per pass; streaming 3.8 GB of bf16 weights at the L4's
-300 GB/s accounts for only 12.7 ms). So the floor dominates at realistic ticket sizes and
+300 GB/s accounts for only 12.7 ms). So the floor dominates at realistic request sizes and
 paying it 16 times rather than twice is the whole problem.
 
-Predicted and then measured, 8 tickets x 7 questions, ~90-token states:
+Predicted and then measured, 8 requests x 7 questions, ~90-token states:
 
     per-request (before)  16 passes, 4,640 tokens   ~824 ms   (measured 790)
     per-batch   (here)     2 passes, 4,640 tokens   ~434 ms
@@ -448,7 +448,7 @@ class BatchedSystemOneEngine(SystemOneEngine):
 
         `states` are the DISTINCT state token sequences; `row_state[r]` indexes into them.
         De-duplication happens here rather than in the caller, so two requests that share
-        a state (the same ticket asked two question sets) cost one state encode -- which
+        a state (the same document asked two question sets) cost one state encode -- which
         is what `model.py::_merge_same_state` used to arrange by hand.
         """
         pad_id = self.tok.pad_token_id if self.tok.pad_token_id is not None else 0

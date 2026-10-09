@@ -74,10 +74,10 @@ DEFAULT_INSTANCE = "ml.g6.xlarge"
 # ml.g6e.xlarge runs this image with NO rebuild -- the L40S is sm89 and Dockerfile.triton
 # already builds for "8.0;8.6;8.9" -- and it is a large win under load. Measured through
 # two live endpoints, same harness, same in-region load generator, 7 questions, distinct
-# tickets (`tools/bench_tickets.py --tickets distinct`):
+# requests (`tools/bench_tickets.py --tickets distinct`):
 #
 #            concurrency 1          concurrency 32 (saturation)
-#            dec/s   server p50     dec/s   server p50   tickets/s
+#            dec/s   server p50     dec/s   server p50   requests/s
 #   g6  (L4)  63.4     102.5 ms      99.0     620 ms       14.15
 #   g6e (L40S) 66.1      95.7 ms     269.8     209 ms       38.55
 #            +4%       -7%          +173%     -66%         +172%
@@ -117,8 +117,8 @@ DEFAULT_INSTANCE = "ml.g6.xlarge"
 # and only took CPU from the first.
 #
 # Cost per unit of work therefore FAVOURS g6e at full load, despite 2.31x the hourly rate:
-#   g6  : 14.15 tickets/s -> ~50,900 tickets/hr  -> $0.0221 per 1,000 tickets
-#   g6e : 38.55 tickets/s -> ~138,800 tickets/hr -> $0.0188 per 1,000 tickets  (-15%)
+#   g6  : 14.15 requests/s -> ~50,900 requests/hr  -> $0.0221 per 1,000 requests
+#   g6e : 38.55 requests/s -> ~138,800 requests/hr -> $0.0188 per 1,000 requests  (-15%)
 # It is worse value only if your traffic is thin enough that you never leave concurrency 1,
 # where you would be paying 2.31x for 4%.
 #
@@ -129,9 +129,9 @@ DEFAULT_INSTANCE = "ml.g6.xlarge"
 # dynamic batcher has formed a batch, so it measures ONE PASS PAIR and excludes the queue
 # wait completely. Under load it converges on the cost of a full pass and stays there
 # forever. Re-measured from a dedicated c7i.8xlarge load generator (32 vCPU, nothing else on
-# it, `bench_tickets.py --processes 16`), 7 questions, distinct tickets:
+# it, `bench_tickets.py --processes 16`), 7 questions, distinct requests:
 #
-#   instance         vCPU   $/hr     dec/s c=32   dec/s c=192   server p50   $/1,000 tickets
+#   instance         vCPU   $/hr     dec/s c=32   dec/s c=192   server p50   $/1,000 requests
 #   ml.g6e.4xlarge    16    3.7553      277.6        325.8        205 ms         0.0224
 #   ml.g6e.16xlarge   64    9.4715      273-279      331.1        208 ms         0.0556
 #
@@ -662,7 +662,7 @@ def configure_autoscaling(region: str, endpoint: str, variant: str,
     which makes it a poor scaling signal here. Invocations-per-instance maps directly onto
     the thing with a known ceiling.
 
-    `target` is per instance per MINUTE, and the measured ceiling is ~14 tickets/s, i.e.
+    `target` is per instance per MINUTE, and the measured ceiling is ~14 requests/s, i.e.
     ~840/minute. ~250 is about 30% of that and is the recommended operating point: a new
     instance needs ~12 minutes to serve traffic, so scale-out has to be requested long
     before the current instance is in trouble. 600 (~70%) was deployed first and is too

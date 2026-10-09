@@ -300,21 +300,21 @@ it. Transport-level problems (throttling, endpoint not in service) surface as a 
 
 ## 6. Operational notes for the calling project
 
-**Latency.** ~50–70 ms server-side for a typical ticket, plus ~8–10 ms if you call from
+**Latency.** ~50–70 ms server-side for a typical request, plus ~8–10 ms if you call from
 inside `us-west-2`. From outside the region the round trip dominates — the same request
 measuring 44 ms server-side takes 500–630 ms from a laptop. **Co-locate if latency
 matters.**
 
 **Concurrency is where this endpoint earns its keep.** Requests arriving together are
 coalesced into one GPU pass (up to 8), so throughput improves markedly under concurrent
-load: ~99 decisions/s (~14 tickets/s at 7 questions) at saturation on the single instance.
+load: ~99 decisions/s (~14 requests/s at 7 questions) at saturation on the single instance.
 At concurrency 1 you get none of that. Send concurrently if you have batch work.
 
 **Back-pressure.** The queue is bounded at 256 and then **rejects** rather than queueing
 further. Treat a rejection as "slow down", not as a failure — retry with backoff.
 
 **Under heavy load, latency becomes queueing.** At 32 requests in flight a 7-question
-ticket sits at ~615 ms p50. Set your client timeout accordingly (60 s is SageMaker's hard
+request sits at ~615 ms p50. Set your client timeout accordingly (60 s is SageMaker's hard
 ceiling anyway).
 
 **Limits.** Max request payload 6 MB; max invocation duration 60 s. The model's context

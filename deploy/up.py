@@ -309,7 +309,7 @@ def verify(region: str, endpoint: str) -> dict:
     if missing:
         raise SystemExit(f"endpoint answered without {sorted(missing)}: {out}")
     # Shape, not value: the correctness gate is tools/reference_check.py against the
-    # model's published reference values, not a smoke test's opinion of one ticket.
+    # model's published reference values, not a smoke test's opinion of one request.
     if not 0.0 <= answers["urgent"]["noul"] <= 1.0:
         raise SystemExit(f"noul out of range: {answers['urgent']}")
     if answers["team"]["choice"] not in {"billing", "technical"}:

@@ -28,7 +28,7 @@ generation, no decode loop, no prompt parsing on the way out.
 
 ```
 POST /invocations
-  { "state": "<the ticket, email, transcript, document>",
+  { "state": "<any text or JSON: a document, email, pull request, contract clause, record>",
     "questions": {
       "urgent":     { "type": "noul",   "instructions": "Does this convey urgency?" },
       "department": { "type": "choice", "instructions": "Who handles this?",
@@ -68,29 +68,29 @@ against the hidden state at each option's last token. One prefill, one readout, 
 extra questions are nearly free: on one L4, 1 question costs 47 ms and 7 cost 67 ms.
 The engine encodes the state once and forks its KV/recurrent cache across the questions
 when that is cheaper than re-encoding it, and takes a single combined pass when it is not.
-It applies the same trick **across concurrent requests**, so a batch of tickets costs two
-forward passes in total rather than two per ticket.
+It applies the same trick **across concurrent requests**, so a batch of requests costs two
+forward passes in total rather than two per request.
 
 ## Measured on the live endpoint
 
-`ml.g6.xlarge` (one NVIDIA L4), warm, server-side, 7 questions per ticket.
+`ml.g6.xlarge` (one NVIDIA L4), warm, server-side, 7 questions per request.
 
 | | |
 | --- | --- |
 | Latency, 1 question | **47 ms** |
 | Latency, 7 questions | **67 ms** (9.6 ms per decision) |
 | Latency, 7 questions + a ~400-token attached document | 104 ms |
-| Throughput at saturation | **~99 decisions/s** (~14 tickets/s, ~50,000 tickets/hour) |
-| Cost | $1.1267/hr hosting → **~$0.022 per 1,000 tickets** at full load |
+| Throughput at saturation | **~99 decisions/s** (~14 requests/s, ~50,000 requests/hour) |
+| Cost | $1.1267/hr hosting → **~$0.022 per 1,000 requests** at full load |
 | Correctness | **0 decision mismatches** against the model's published reference values (max Δp 0.0020) |
 | Cold start | ~12 min to `InService` (dominated by the 20.6 GB image pull); ~25 s container start with a warm kernel cache |
 
 A caller inside the same AWS region adds ~8–10 ms. Under load, latency becomes queueing:
-at 32 requests in flight a 7-question ticket sits at ~615 ms p50. Autoscaling exists to
+at 32 requests in flight a 7-question request sits at ~615 ms p50. Autoscaling exists to
 keep you off that.
 
 **Every number above is with both accelerators off, which is the default.** Turning CUDA
-graphs on (`SD_CUDA_GRAPHS=1`) takes a 1-question ticket from ~46 ms to **21 ms** and a
+graphs on (`SD_CUDA_GRAPHS=1`) takes a 1-question request from ~46 ms to **21 ms** and a
 2-question one from ~48 ms to **30 ms**, and leaves the 7-question figure alone. See
 [Known limits](#known-limits) for why the split falls there.
 
@@ -98,11 +98,11 @@ Both knobs are now also measured **through a served endpoint**, on an L40S, incl
 two of them **on together** — which `v24-accel` (2026-10-09) is the first image to make
 possible. Headline: graphs **2.90x** at one question, fusion **1.16x** at 7-question
 saturation, the two compose, and `both` is the best configuration at every operating point
-except a single-request 7-question ticket. See
+except a single-request 7-question request. See
 [Both accelerators on a served L40S](#both-accelerators-on-a-served-l40s-v24-accel).
 
 Long states are this deployment's strength: nearly doubling the input (601 → 1,025 tokens)
-costs ~14% of throughput, because the state is paid once per ticket rather than once per
+costs ~14% of throughput, because the state is paid once per request rather than once per
 question.
 
 ## Layout
@@ -263,7 +263,7 @@ deploy/create_endpoint.py --image <same> --role <same> \
 ```
 
 **Pick this target from the measured ceiling, and note it is per instance per *minute*.**
-Saturation is ~14 tickets/s, i.e. ~840 invocations/instance/minute, so:
+Saturation is ~14 requests/s, i.e. ~840 invocations/instance/minute, so:
 
 | target | share of ceiling | effect |
 | --- | --- | --- |
@@ -331,11 +331,11 @@ rather than the one that served it is simply wrong.
 
 **`ml.g6e.xlarge` needs no rebuild** — the L40S is sm89 and `deploy/Dockerfile.triton`
 already targets `8.0;8.6;8.9`. Measured through two live endpoints, same harness, same
-in-region load generator, 7 questions, distinct tickets:
+in-region load generator, 7 questions, distinct requests:
 
 | | concurrency 1 | | concurrency 32 (saturation) | | |
 | --- | --- | --- | --- | --- | --- |
-| | decisions/s | server p50 | decisions/s | server p50 | tickets/s |
+| | decisions/s | server p50 | decisions/s | server p50 | requests/s |
 | `g6` (L4) | 63.4 | 102.5 ms | 99.0 | 620 ms | 14.15 |
 | `g6e` (L40S) | 66.1 | 95.7 ms | **269.8** | **209 ms** | **38.55** |
 | | +4% | −7% | **+173%** | **−66%** | +172% |
@@ -354,7 +354,7 @@ server**, and which regime you care about picks the instance. The same fact expl
 merely busy, so a second process found no idle GPU to overlap into.
 
 Cost per unit of work therefore **favours `g6e` at full load**, despite 2.31× the hourly
-rate — ~$0.0188 per 1,000 tickets against ~$0.0221, about 15% cheaper. It is worse value
+rate — ~$0.0188 per 1,000 requests against ~$0.0221, about 15% cheaper. It is worse value
 only if your traffic never leaves concurrency 1, where you would pay 2.31× for 4%.
 
 Three things to know before you rely on this:
@@ -384,12 +384,12 @@ Three things to know before you rely on this:
 The open question after the table above was whether 269.8 decisions/s was the card or the
 4-vCPU host issuing kernel launches. **It is neither: it is `max_batch_size`.**
 
-Measured through live endpoints, 7 questions, distinct tickets, from a **dedicated
+Measured through live endpoints, 7 questions, distinct requests, from a **dedicated
 `c7i.8xlarge` load generator** (32 vCPU, nothing else on it) with
 `tools/bench_tickets.py --processes 16`. Every cell's load-generator CPU is in the table
 because without it a throughput number is not a measurement of the server:
 
-| instance | vCPU | $/hr | c | decisions/s | tickets/s | server p50 | e2e p50 | GPU | loadgen CPU | $/1,000 tickets |
+| instance | vCPU | $/hr | c | decisions/s | requests/s | server p50 | e2e p50 | GPU | loadgen CPU | $/1,000 requests |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `ml.g6e.4xlarge` | 16 | 3.7553 | 1 | 68.2 | 9.8 | 93 ms | 103 ms | — | 0.1% | — |
 | | | | 8 | 214.2 | 30.6 | 121 ms | 245 ms | — | 0.2% | $0.0341 |
@@ -459,7 +459,7 @@ type** (`ml.g6e.16xlarge`), the same harness and the same load generator; only t
 | server p95 at c=8 | **141 ms** | 225 ms | 1,822 ms |
 | GPU util under load | 71–80% | 93–100% | 100% |
 | GPU memory | 14.2% | 27.3% | 53.8% |
-| $/1,000 tickets, best cell | $0.0556 | $0.0505 | $0.0490 |
+| $/1,000 requests, best cell | $0.0556 | $0.0505 | $0.0490 |
 
 ⁽*⁾ a `preferred_batch_size` stall, not a `count: 4` property — see
 [Known limits](#known-limits). Its p95 was 7.8 s.
@@ -529,7 +529,7 @@ requests batched alongside it.
 | `tools/triton_smoke.sh` | starts the image the way SageMaker does (`docker run <image> serve`) and checks readiness, all three primitives, batching, caller errors, and that warm-up covered the shapes. |
 | `tools/batch_parity.py` | cross-request batching against the single-request path. Gate: **zero decision flips**; probability drift is advisory (≤7e-3 — batching changes bf16 reduction order). `--cuda-graphs` / `--cuda-graphs-two-pass` put the batched side on the graph path and additionally **fail if nothing was captured or replayed**, so a silent fallback cannot pass the gate. |
 | `tools/fused_ab.py` | the fused kernels (`SD_FUSE_LAYERS=1`) against the reference torso: same requests, both readout routes, max and mean \|Δp\| per primitive, plus the torso forward timed both ways. `--fp32-reference` runs the same torso in fp32 as an arbiter, because two bf16 paths can differ by more than either differs from the exact answer. `--batch-time` times `evaluate_many` on a full Triton batch in-process, with no HTTP and no load generator — the only speed measurement this box can take honestly. Gate: **zero decision flips**. |
-| `tools/bench_tickets.py` | tickets/s, decisions/s and per-decision latency by question count, ticket length and concurrency. Use `--tickets distinct` (the default). |
+| `tools/bench_tickets.py` | requests/s, decisions/s and per-decision latency by question count, request length and concurrency. Use `--tickets distinct` (the default). |
 | `tools/sm_sweep.py`, `tools/loadsweep_triton.py` | load sweeps through the endpoint and straight to the container. Both record GPU utilisation alongside throughput, so a saturated card is distinguishable from a starved load generator. |
 
 Run load tests **in-region**. From a laptop the round trip dominates and you measure the
@@ -583,7 +583,7 @@ The standing hypothesis was that throughput was limited by `max_batch_size`: 8 r
 7 questions = 56 rows against a `max_rows` budget of 128, so the engine's own row budget was
 only 44% used, and widening the batch should buy amortisation. **It does not.** Measured on
 one L40S (`ml.g6e.8xlarge`, 32 vCPU), in-region 32-vCPU load generator, 7 questions,
-distinct tickets from a pool of 512, `reference_check` clean on every configuration.
+distinct requests from a pool of 512, `reference_check` clean on every configuration.
 
 **The cheap experiment first, because it needs no redeploy.** Rows per pass is
 `max_batch_size × questions`, so holding `max_batch_size` at 8 and varying the question
@@ -641,7 +641,7 @@ geometry, which is now closed from both directions.
 
 Peak throughput here costs five seconds of queueing, which is not a recommendation:
 
-| concurrency | decisions/s | server p50 | end-to-end p50 | $/1,000 tickets (g6e.4xlarge) |
+| concurrency | decisions/s | server p50 | end-to-end p50 | $/1,000 requests (g6e.4xlarge) |
 | --- | --- | --- | --- | --- |
 | 8 | 217.0 | 120 ms | **242 ms** | $0.0336 |
 | 16 | 266.7 | 204 ms | 411 ms | $0.0274 |
@@ -675,7 +675,7 @@ deployable's L4, `tools/fused_ab.py`:
 
 | | reference | fused | |
 | --- | --- | --- | --- |
-| **Full batch, 8 tickets × 7 questions** (56 rows — the shape `max_batch_size: 8` produces), least-contended pair | 540 ms / **103.8 decisions/s** | 419 ms / **133.7 decisions/s** | **1.29x** |
+| **Full batch, 8 requests × 7 questions** (56 rows — the shape `max_batch_size: 8` produces), least-contended pair | 540 ms / **103.8 decisions/s** | 419 ms / **133.7 decisions/s** | **1.29x** |
 | …across 7 interleaved rounds | 540–1,154 ms | 419–895 ms | 1.05–1.99x, fused faster in **7 of 7** |
 | Torso forward, batch 1, 128 tokens | 42 ms | 49 ms | **0.85x — fused is slower** |
 | Torso forward, batch 1, 1,024 tokens | 84 ms | 73 ms | 1.14x |
@@ -729,11 +729,11 @@ runs five kernel-contract probes on the GPU before rewriting anything, and raise
 ### `instance_group count`: measured, 1 wins
 
 This was the README's "cheapest untried lever". It is now tried, and it does not pay.
-`ml.g6.xlarge` (one L4, **4 vCPU**), 7 questions per ticket, distinct tickets,
+`ml.g6.xlarge` (one L4, **4 vCPU**), 7 questions per request, distinct requests,
 `tools/bench_tickets.py --tickets distinct`, server-side latency, each row at the
 concurrency where that setting peaks (c=32):
 
-| `count` | decisions/s | tickets/s | server p50 | server p95 | GPU util (mean / median) | GPU memory |
+| `count` | decisions/s | requests/s | server p50 | server p95 | GPU util (mean / median) | GPU memory |
 | --- | --- | --- | --- | --- | --- | --- |
 | **1** | **101.5** | **14.5** | **611 ms** | **615 ms** | 83% / 85% | 4.7 GB |
 | 2 | 91.4 | 13.1 | 1,334 ms | 1,348 ms | 89% / 100% | 9.2 GB |
@@ -801,11 +801,11 @@ Host: one L40S on `ml.g6e.4xlarge`… except it is not. An `--instance-pools`
 (`describe_placement`: `AllTraffic: ml.g6e.8xlarge x1`) in 6½ minutes, because the 4xlarge
 pool had no capacity. **$5.6607/hr, not the 4xlarge's $3.7553.** Same single L40S, twice the
 vCPU — and vCPU is already known not to be the lever here, so the throughput carries over to
-a 4xlarge but the cost per ticket does not. The remaining four deploys were **pinned** to
+a 4xlarge but the cost per request does not. The remaining four deploys were **pinned** to
 `ml.g6e.8xlarge` so the 2×2 is four readings of one card, not four cards.
 
 Method: dedicated in-region `c7i.8xlarge` load generator (32 vCPU), `bench_tickets.py
---sections 4`, distinct tickets from a pool of 64, 20 s per cell, **each cell run twice and
+--sections 4`, distinct requests from a pool of 64, 20 s per cell, **each cell run twice and
 the second reading reported**. `reference_check.py --endpoint` clean on all four
 configurations.
 
@@ -862,7 +862,7 @@ Server p50 / end-to-end p50, milliseconds:
 
 ### Cost, and the operating point
 
-`$`/1,000 tickets on the `ml.g6e.8xlarge` that was actually placed ($5.6607/hr), with the
+`$`/1,000 requests on the `ml.g6e.8xlarge` that was actually placed ($5.6607/hr), with the
 `ml.g6e.4xlarge` projection in brackets (same single L40S, $3.7553/hr):
 
 | | neither | both |
@@ -901,7 +901,7 @@ server. Measured: 149.8 decisions/s on the first pass against 273.0 on the secon
 (unaccelerated); with fusion on, the first pass stalled to a **20–24 s server p50 with 4–5
 errors**. The tell is that the depressed cells report a *healthy* p50 and e2e p50 that are
 arithmetically inconsistent with their own throughput — 16 in flight at 352 ms is ~45
-tickets/s, and one such cell reported 11.4. Re-measured in isolation the same cell was flat
+requests/s, and one such cell reported 11.4. Re-measured in isolation the same cell was flat
 at 317–323 decisions/s across `--processes 1, 2, 4, 8, 16`.
 
 Hence "each cell twice, report the second". Every number above is a second reading.
@@ -925,7 +925,7 @@ Hence "each cell twice, report the second". Every number above is a second readi
   the one caution is that 32 was already tried *without* raising `max_rows` and was much
   worse.
 - **The dynamic batcher looks bistable at `preferred_batch_size: [4, 8]`.** Two cells out of
-  17 across two instance types came in at 23.4 and 23.7 tickets/s where their neighbours
+  17 across two instance types came in at 23.4 and 23.7 requests/s where their neighbours
   (and a repeat of the same cell seconds later) gave 39–44, with server p50 unchanged at
   205 ms and zero errors. A constant batch cost at 60% of the throughput means 60% of the
   batch size, i.e. ~5 requests per pass instead of 8. Not diagnosed; the cheap experiment is
@@ -1060,7 +1060,7 @@ Hence "each cell twice, report the second". Every number above is a second readi
   CUDA graphs are the mirror image: **2.90x** on a served one-question request, **1.02x —
   nothing — at seven**. Measured on together, the two **compose** rather than conflict, so
   `SD_FUSE_LAYERS=1 SD_CUDA_GRAPHS=1` is the right default for a mixed workload and the
-  only point it loses is a single-request 7-question ticket (0.88x). See
+  only point it loses is a single-request 7-question request (0.88x). See
   [Both accelerators on a served L40S](#both-accelerators-on-a-served-l40s-v24-accel).
 - **`instance_group count: 2` is measured and buys nothing.** It is neutral when
   `max_batch_size` moves with it and 10% worse when it does not; `count: 4` loses ~8% even
@@ -1075,7 +1075,7 @@ Hence "each cell twice, report the second". Every number above is a second readi
   generator is on its own host. An earlier version of this section suggested buying vCPU to
   issue the dispatch stream faster; that was wrong.
 
-  It is worse than neutral on cost, because price is not flat: **$/1,000 tickets degrades
+  It is worse than neutral on cost, because price is not flat: **$/1,000 requests degrades
   3.7x, $0.022 → $0.080**, from 4 to 64 vCPU. **On a fixed GPU, buy the smallest vCPU count
   that fits.** The levers that remain all attack the dispatch floor itself (`SD_CUDA_GRAPHS`)
   or the GPU work (`SD_FUSE_LAYERS`, a faster card).

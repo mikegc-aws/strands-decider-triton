@@ -175,7 +175,7 @@ def _req(state: str, n_questions: int = 2):
 
 
 def test_identical_states_are_encoded_once():
-    """Two requests about the same ticket must not encode that ticket twice. This is
+    """Two requests about the same document must not encode that document twice. This is
     what `model.py::_merge_same_state` used to arrange by hand."""
     eng = _StubEngine()
     out = eng.evaluate_many([_req("same"), _req("same"), _req("other")])
@@ -363,7 +363,7 @@ def test_fourteen_questions_take_two_passes():
 
 
 def test_a_busy_batch_takes_two_passes():
-    """8 tickets x 7 questions duplicates 8 x 6 x 90 = 4,320 tokens. This is the case the
+    """8 requests x 7 questions duplicates 8 x 6 x 90 = 4,320 tokens. This is the case the
     whole cross-request change exists for, so it must not route to one pass."""
     eng = _route_engine()
     eng.evaluate_many([_req(f"s{i}", 7) for i in range(8)])

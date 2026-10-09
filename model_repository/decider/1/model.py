@@ -343,7 +343,7 @@ class TritonPythonModel:
         ever submits one request at a time leaves most of a loaded server's shapes to be
         captured under load, and this method exists precisely so that does not happen.
 
-        Each request in a batch carries a DISTINCT state, as distinct tickets do. That is
+        Each request in a batch carries a DISTINCT state, as distinct requests do. That is
         not cosmetic: `BatchedSystemOneEngine.DUP_TOKEN_BUDGET` sends a batch with heavily
         shared state to the two-pass route instead, which `SD_CUDA_GRAPHS=1` does not graph
         at all -- so a warm-up built from one repeated state would drive the wrong route
@@ -365,7 +365,7 @@ class TritonPythonModel:
                     # The index makes each state distinct; the repeat makes it the right
                     # length. Both are load-bearing -- see the docstring on duplication.
                     state=("warm up the kernels for this state length. "
-                           * max(1, approx_tokens // 10)) + f" ticket {i} ",
+                           * max(1, approx_tokens // 10)) + f" document {i} ",
                     questions={k: questions[k] for k in names[:n_questions]})
                 for i in range(width)
             ]

@@ -136,7 +136,7 @@ instance_group [
     # binding constraint -- all three fit with room to spare.
     #
     # 1 is now MEASURED, and 2 and 3 are both WORSE. ml.g6.xlarge (one L4, 4 vCPU),
-    # 7 questions per ticket, distinct tickets, server-side latency, at the concurrency
+    # 7 questions per request, distinct requests, server-side latency, at the concurrency
     # where each setting peaks (c=32):
     #
     #     count   decisions/s   p50       p95       GPU util (mean/median)

@@ -231,12 +231,12 @@ def time_torso(checkpoint: str, merged: str, device: str, *, fused: bool,
     return out
 
 
-BATCH_TICKETS = 8   # config.pbtxt's max_batch_size: what a full Triton batch looks like
+BATCH_REQUESTS = 8   # config.pbtxt's max_batch_size: what a full Triton batch looks like
 
 
 def time_batch(checkpoint: str, merged: str, device: str, max_rows: int, *,
                fused: bool, repeats: int) -> dict[str, float]:
-    """Time `evaluate_many` on a full Triton batch: 8 distinct tickets x 7 questions.
+    """Time `evaluate_many` on a full Triton batch: 8 distinct requests x 7 questions.
 
     This is the measurement that matters and the only one this box can take honestly.
 
@@ -244,7 +244,7 @@ def time_batch(checkpoint: str, merged: str, device: str, max_rows: int, *,
     g6.xlarge the generator is **co-resident on 4 vCPUs** with a model whose cost is partly
     CPU dispatch. The client and the server then compete for the exact resource under test,
     and the numbers wander by 2-3x between runs -- at concurrency 8 one run gave 0.67
-    tickets/s with a 13.4 s server p50, which is a measurement of the client, not the model.
+    requests/s with a 13.4 s server p50, which is a measurement of the client, not the model.
     A second agent sharing the card makes it worse.
 
     So: no HTTP, no threads, no queueing. One process calls the engine directly on the shape
@@ -271,9 +271,9 @@ def time_batch(checkpoint: str, merged: str, device: str, max_rows: int, *,
         raise SystemExit("[ab] torso fusion state does not match the label")
 
     # Distinct states, so nothing de-duplicates and the batch is the honest 8-state shape.
-    tickets = [f"Ticket {i}: {MEDIUM}" for i in range(BATCH_TICKETS)]
-    requests = [SystemOneRequest(state=t, questions=dict(QUESTIONS)) for t in tickets]
-    n_decisions = BATCH_TICKETS * len(QUESTIONS)
+    states = [f"Document {i}: {MEDIUM}" for i in range(BATCH_REQUESTS)]
+    requests = [SystemOneRequest(state=s, questions=dict(QUESTIONS)) for s in states]
+    n_decisions = BATCH_REQUESTS * len(QUESTIONS)
 
     for _ in range(3):
         engine.evaluate_many(requests)
@@ -432,7 +432,7 @@ def main() -> int:
     ap.add_argument("--repeats", type=int, default=20)
     ap.add_argument("--out", default="", help="write the full comparison to this JSON file")
     ap.add_argument("--batch-time", action="store_true",
-                    help="time evaluate_many on a full Triton batch (8 tickets x 7 questions)")
+                    help="time evaluate_many on a full Triton batch (8 requests x 7 questions)")
     ap.add_argument("--only", choices=["reference", "fused"], default="",
                     help="run one torso only and exit. With --batch-time, lets a shell loop "
                          "interleave the two modes so background load on a shared box "

@@ -31,7 +31,7 @@ What the reference spends the launches on, and what replaces it, per decoder lay
 What it bought, measured on this deployable's L4 (`tools/fused_ab.py`), and why it is still
 **off by default**:
 
-    full batch, 8 tickets x 7 questions (56 rows)   540 ms -> 419 ms   1.29x
+    full batch, 8 requests x 7 questions (56 rows)   540 ms -> 419 ms   1.29x
       (103.8 -> 133.7 decisions/s; fused faster in 7 of 7 interleaved rounds)
     torso forward, batch 1,   128 tokens             42 ms ->  49 ms   0.85x  SLOWER
     torso forward, batch 1, 1,024 tokens             84 ms ->  73 ms   1.14x
@@ -506,7 +506,7 @@ def verify_kernels(layers: nn.ModuleList) -> dict[str, float]:
     tail, _ = causal_conv1d(cx[:, 2 * W:], cw, None, initial_state=state,
                             activation=linear.activation)
     agree("conv_state_continuation", whole, torch.cat([head, tail], dim=1),
-          "a question suffix is convolved against the state the ticket left behind. If the "
+          "a question suffix is convolved against the state the request left behind. If the "
           "state convention differs, the first W tokens of every suffix see the wrong left "
           "context -- which reads as a slightly-off probability, never as an error.")
 
