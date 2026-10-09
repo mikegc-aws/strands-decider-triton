@@ -23,18 +23,48 @@ backend: "python"
 
 # Requests the dynamic batcher may coalesce into one execute() call.
 #
-# 8 is now MEASURED, not a starting point. With cross-request batching in the backend
-# (`evaluate_many`), 8 requests x 7 questions = 56 question rows, which fits
-# `BatchedSystemOneEngine.max_rows` (128) in a single pass pair. Raising this to 32 was
-# tried and is WORSE -- 56 decisions/s at concurrency 32 against 101.5 at
-# max_batch_size 8, with server p50 going 611 ms -> 2,031 ms. The Triton log shows why:
-# it occasionally forms batches of 26 requests (182 rows), which exceeds max_rows, gets
-# chunked into two pass pairs anyway, and so buys no extra amortisation while adding
-# queueing delay and activation memory.
+# 8 is MEASURED, and 16 has now been measured too and is NOT better. Raising this to 32 was
+# tried earlier and is much worse -- 56 decisions/s at concurrency 32 against 101.5 at
+# max_batch_size 8, with server p50 going 611 ms -> 2,031 ms -- because Triton formed
+# batches of 26 requests (182 rows), exceeded max_rows, and got chunked into two pass pairs
+# anyway, buying no amortisation while adding queueing delay and activation memory.
 #
-# So the rule is: max_batch_size * typical questions per request should land at or just
-# under max_rows. If callers routinely send 14 questions, drop this to 8 and raise
-# max_rows, or drop this to 4.
+# THE DEEPER REASON, and it says this knob is finished. On an L40S, with max_batch_size
+# fixed at 8 and only the question count varied (so rows per pass = 8 x questions), the
+# per-pass time is PURELY LINEAR in rows -- there is no fixed cost left to amortise:
+#
+#   questions  rows/pass  server p50   ms/row   decisions/s (c=32)
+#       1          8        48.4 ms    6.050        160.1        <- one-pass route
+#       7         56       203.6 ms    3.636        281.4
+#      14        112       410.8 ms    3.668        291.9
+#      28        224       806.4 ms    3.600        292.6
+#
+# Fitting `time = a + b x rows` over the three shared-prefix rows gives a between -3.6 and
+# +15 ms against passes of 204-806 ms, i.e. a fixed cost indistinguishable from ZERO, and
+# b ~= 3.6 ms per row. Rows per second is therefore constant: throughput is FLAT at ~290
+# decisions/s whether a pass carries 56, 112 or 224 rows.
+#
+# The ~45 ms per-pass dispatch floor that motivated widening the batch is real but is a
+# SINGLE-REQUEST phenomenon (the 8-row cell above, at 48.4 ms, is that floor). It is already
+# fully amortised at 56 rows, so there is nothing for a wider batch to recover.
+#
+# Confirmed head-on with a deployed `max_batch_size: 16` (112 rows at 7 questions), same
+# card, same harness, reference_check clean on both:
+#
+#   concurrency        8       32       64      128      192
+#   mbs  8 dec/s    217.0    281.4    291.6    314.3    336.3
+#   mbs 16 dec/s    190.4    258.3    287.0    308.3    325.2
+#   mbs  8 p50      120 ms   203 ms   204 ms   204 ms   204 ms
+#   mbs 16 p50      156 ms   415 ms   415 ms   416 ms   417 ms
+#
+# 16 is 1.6-12% SLOWER at every concurrency and doubles server p50. Keep 8: it is the
+# smallest batch that already sits on the linear part of the curve, so it buys the full
+# amortisation at half the latency.
+#
+# The rule still holds and still matters, because violating it is how you get the 32 result:
+# max_batch_size * typical questions per request should land at or just under max_rows. If
+# callers routinely send 14 questions, 8 x 14 = 112 still fits 128 -- but drop this to 4 if
+# they send 28 or more, or raise SD_MAX_ROWS to match.
 max_batch_size: 8
 
 input [
@@ -60,6 +90,19 @@ output [
 dynamic_batching {
   # Try to fill 4 then 8. Preferred sizes are a hint; Triton still dispatches a smaller
   # batch once the queue delay expires.
+  #
+  # `[ 8 ]` alone was MEASURED against this and is a wash under load -- within +-1% at every
+  # saturated concurrency (32/64/128/192: 283.2/294.3/317.1/339.5 decisions/s against
+  # 281.4/291.6/314.3/336.3), reference_check clean, server p50 identical at ~202 ms. The
+  # one real difference is at LOW load, where dropping the 4 costs ~9% (concurrency 4:
+  # 129.8 against 142.1 decisions/s) because a queue of four is no longer a preferred size
+  # and has to wait out max_queue_delay. So keeping the 4 is worth it, and the reason is
+  # latency at thin traffic rather than throughput at saturation.
+  #
+  # It was also tested as a suspect for an apparent BISTABILITY -- cells reading ~60% of
+  # their neighbours at unchanged server p50 and zero errors. It is not the cause. See
+  # tools/bench_tickets.py: the systematic part of that was the load generator charging
+  # per-process startup to a fixed denominator, and it is fixed there.
   preferred_batch_size: [ 4, 8 ]
 
   # 2 ms. The number worth understanding rather than copying: this is pure added latency

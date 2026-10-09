@@ -273,10 +273,45 @@ scale-to-zero is not appropriate for latency-sensitive traffic.
 
 Teardown: `deploy/create_endpoint.py --name strands-decider-g6 --delete`.
 
-**Target `ml.g6`/`ml.g6e` (Ada).** If capacity is short, launch several
-`create_endpoint.py` attempts concurrently under different `--name` values and keep
-whichever lands — a capacity failure takes ~31 minutes to surface, so running the ladder
-in parallel beats running it in series. Delete the losers.
+**Target `ml.g6`/`ml.g6e` (Ada), and use `--instance-pools` when capacity is short.**
+
+```
+deploy/create_endpoint.py --image <uri> --role <arn> \
+    --instance-pools ml.g6e.4xlarge,ml.g6e.2xlarge,ml.g6e.xlarge,ml.g6e.8xlarge
+```
+
+SageMaker takes up to five instance types per production variant in priority order and
+falls back automatically on `InsufficientInstanceCapacity`, so **one** `CreateEndpoint`
+covers the whole ladder. This replaces the old advice here — launch several endpoints under
+different `--name` values and keep whichever lands — which worked but needed a human
+watching three deploys and left two to tear down.
+
+Measured, and the margin is the point. Ada capacity in this account was genuinely short:
+a pooled attempt over `4xlarge → 2xlarge → xlarge` exhausted all three and failed in
+**20 minutes**; the same list retried with `8xlarge` appended landed on the **priority-4
+fallback in 9 minutes**. Serially, discovering that would have been four
+`CreateEndpoint` attempts at ~31 minutes each — about **two hours** — and the first three
+would each have looked like a dead end.
+
+Two details worth knowing:
+
+- `InstancePools` **replaces** `InstanceType`; sending both is a validation error.
+- `VariantInstanceProvisionTimeoutInSeconds` (300–3600, set to 900 here) bounds the *total*
+  attempt across all pools. It is what converts a half-hour dead end into a 15-minute one,
+  and the whole value of pooling is a fast failure.
+
+Because the pool decides *after* you ask, `create_endpoint.py` prints which type actually
+landed (`describe_placement`) — a throughput number attributed to the type you requested
+rather than the one that served it is simply wrong.
+
+> **Quota note.** Endpoint-usage quota in this account is **1** for every `ml.g6e` size
+> (and 0 for 24xlarge/48xlarge). That also means `UpdateEndpoint` cannot move a live g6e
+> endpoint to a new config: blue/green needs `2 ×` the instance count at once, so the update
+> is refused for want of capacity and the endpoint keeps serving the old config — i.e. the
+> deploy looks like it did nothing. **Delete-and-recreate is the only path**, which is why a
+> `config.pbtxt` sweep costs a full teardown per cell. A bump to 2 would unblock in-place
+> updates *and* make the autoscaling policy more than decorative; it is the cheapest single
+> unblock available here.
 
 ### Picking an instance: `ml.g6e.xlarge` is 2.7× under load
 
@@ -399,15 +434,98 @@ loud:
 
 | knob | where | note |
 | --- | --- | --- |
-| `max_batch_size` | `config.pbtxt` | Requests coalesced per `execute()`. **8**, measured. Keep `max_batch_size × typical questions` at or just under `max_rows`; 32 was tried and is worse. |
+| `max_batch_size` | `config.pbtxt` | Requests coalesced per `execute()`. **8**, measured, and **finished** — 16 was deployed and is 1.6–12% *slower* at every concurrency while doubling server p50 (204 → 417 ms), and 32 is much worse. Pass time is linear in rows with no measurable fixed term, so a wider batch has nothing left to amortise. See [Batch geometry](#batch-geometry-max_batch_size-is-not-the-ceiling). |
 | `max_queue_delay_microseconds` | `config.pbtxt` | 2 ms. Pure added latency for a request arriving into an empty queue, so keep it small relative to the work. |
 | `max_queue_size` | `config.pbtxt` | 256, then reject. Bounded shedding beats unbounded latency — a load balancer can act on a refusal. |
 | `instance_group count` | `config.pbtxt` | **1**, measured. 2 and 3 both fit in memory and are both *worse* — 91.4 and 79.8 decisions/s against 101.5. See [below](#instance_group-count-measured-1-wins). |
-| `max_rows` | `BatchedSystemOneEngine` | 128 question rows per pass. Activation memory for the whole in-flight batch. |
+| `max_rows` | `SD_MAX_ROWS` in `config.pbtxt` | 128 question rows per pass. Activation memory for the whole in-flight batch — measured at only ~6.5 GB of the L40S's 45.8 GB at `max_batch_size 8`, so memory is not what bounds it. Needs an image built from this commit or later; `model.py` refuses to start rather than serve a value it cannot honour. |
+| `preferred_batch_size` | `config.pbtxt` | `[ 4, 8 ]`. `[ 8 ]` alone is a wash at saturation (±1%) and ~9% *worse* at concurrency 4, because a queue of four is then not a preferred size and waits out the queue delay. |
 | `DUP_TOKEN_BUDGET` | `BatchedSystemOneEngine` | 480. Above this many duplicated state tokens, encoding the state once and forking the cache beats a single combined pass. |
 | `SD_ENGINE`, `SD_PREFIX_CACHE` | container env | `merged` folds the LoRA into the torso (no PEFT at runtime). Prefix caching on. |
 | `SD_FUSE_LAYERS` | container env | **0 (off)**. `1` swaps the torso's decoder layers for `flash-linear-attention`'s Triton kernels — see [Fused kernels](#fused-kernels-sd_fuse_layers1) below. Measured **1.29x** on a full 56-row batch (103.8 → 133.7 decisions/s) and *slower* at batch 1. Correctness gates pass; the numbers move. |
 | `SD_CUDA_GRAPHS` | container env | `0`. `1` graphs the one-pass route (1 question 45.9 → 21.5 ms). `all` also graphs the state/row pair, which measured 0.73x–1.02x and is therefore not in `1`. Falls back to eager per shape. See [Known limits](#known-limits). |
+
+## Batch geometry: `max_batch_size` is not the ceiling
+
+The standing hypothesis was that throughput was limited by `max_batch_size`: 8 requests ×
+7 questions = 56 rows against a `max_rows` budget of 128, so the engine's own row budget was
+only 44% used, and widening the batch should buy amortisation. **It does not.** Measured on
+one L40S (`ml.g6e.8xlarge`, 32 vCPU), in-region 32-vCPU load generator, 7 questions,
+distinct tickets from a pool of 512, `reference_check` clean on every configuration.
+
+**The cheap experiment first, because it needs no redeploy.** Rows per pass is
+`max_batch_size × questions`, so holding `max_batch_size` at 8 and varying the question
+count sweeps the row geometry for free:
+
+| questions | rows/pass | server p50 | ms per row | decisions/s (c=32) |
+| --- | --- | --- | --- | --- |
+| 1 | 8 | 48.4 ms | 6.050 | 160.1 |
+| 7 | 56 | 203.6 ms | 3.636 | 281.4 |
+| 14 | 112 | 410.8 ms | 3.668 | 291.9 |
+| 28 | 224 | 806.4 ms | 3.600 | 292.6 |
+
+Fitting `time = a + b × rows` across the three shared-prefix rows gives `a` between −3.6 and
++15 ms against passes of 204–806 ms — **a fixed per-pass cost indistinguishable from zero** —
+and `b ≈ 3.6 ms` per row. Rows per second is therefore constant, and decisions/s is flat at
+~290 whether a pass carries 56, 112 or 224 rows.
+
+The ~45 ms dispatch floor that motivated all of this is real, and the 8-row cell above *is*
+it. But it is a **single-request** phenomenon, and at 56 rows it has already been amortised
+to invisibility. There is nothing left for a wider batch to recover.
+
+**Confirmed head-on**, with `max_batch_size: 16` actually deployed (112 rows at 7 questions):
+
+| concurrency | 1 | 8 | 16 | 32 | 64 | 128 | 192 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| **mbs 8** decisions/s | 68.6 | 217.0 | 266.7 | 281.4 | 291.6 | 314.3 | **336.3** |
+| **mbs 16** decisions/s | 67.9 | 190.4 | — | 258.3 | 287.0 | 308.3 | 325.2 |
+| **mbs 8** server p50 | 94 ms | 120 ms | 204 ms | 203 ms | 204 ms | 204 ms | 204 ms |
+| **mbs 16** server p50 | 93 ms | 156 ms | — | 415 ms | 415 ms | 416 ms | 417 ms |
+
+16 is slower everywhere and doubles server-side latency. **Keep 8.** It is the smallest
+batch already on the linear part of the curve, so it collects the full amortisation at half
+the latency of 16.
+
+### So what *is* the ceiling?
+
+The card — but not in the way the repo previously said. "A filled pass is
+memory-bandwidth-bound" does not survive the arithmetic:
+
+- **The card swap cannot discriminate.** L40S/L4 is 2.88× on bandwidth (864/300 GB/s) and
+  2.99× on dense BF16 tensor cores (362/121 TFLOPS). The measured 2.98× fits both equally,
+  so that experiment proves nothing about which.
+- **Weight streaming is 2.3% of the pass.** 2B parameters × 2 bytes = 4.0 GB, which at
+  864 GB/s is 4.6 ms against a measured 203.6 ms pass. Not a bandwidth wall — and that is
+  the same fact as the linear row cost above, because weight-bound batching would be nearly
+  free.
+- **It is arithmetic-shaped at ~26% of peak.** A 56-row pass pushes ~4,808 input tokens in
+  203.6 ms ≈ 23,600 tok/s, i.e. ~94 TFLOPS for a 2B model, against the L40S's 362 TFLOPS.
+
+So there is roughly 4× of headroom still on this card, and it is reachable only through
+**kernel efficiency** — `SD_FUSE_LAYERS`, CUDA graphs, a compiled torso — not through batch
+geometry, which is now closed from both directions.
+
+### Operating point, not just peak
+
+Peak throughput here costs five seconds of queueing, which is not a recommendation:
+
+| concurrency | decisions/s | server p50 | end-to-end p50 | $/1,000 tickets (g6e.4xlarge) |
+| --- | --- | --- | --- | --- |
+| 8 | 217.0 | 120 ms | **242 ms** | $0.0336 |
+| 16 | 266.7 | 204 ms | 411 ms | $0.0274 |
+| 32 | 281.4 | 203 ms | 820 ms | $0.0259 |
+| 64 | 291.6 | 204 ms | 1,645 ms | $0.0250 |
+| 192 | 336.3 | 204 ms | 4,932 ms | $0.0217 |
+
+**Concurrency 16 is the recommendation**: 79% of peak throughput at 8% of peak tail latency.
+Concurrency 8 is the pick if 250 ms matters more than money.
+
+Note the trap in that table, and it has already caused one wrong conclusion in this project:
+**server p50 is flat at 204 ms from concurrency 16 upward while end-to-end p50 grows 12×.**
+`latency_ms` is timed from the top of `execute()`, which Triton calls *after* batch
+formation, so it excludes queue wait entirely. A flat server p50 means the batcher is
+**always full**, i.e. saturated — not that there is headroom. Judge saturation from
+end-to-end latency rising at constant throughput.
 
 ## Fused kernels (`SD_FUSE_LAYERS=1`)
 

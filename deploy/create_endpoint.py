@@ -87,9 +87,28 @@ DEFAULT_INSTANCE = "ml.g6.xlarge"
 # issuing ~5,676 kernel launches -- the ~45 ms floor, which the GPU cannot help with. Under
 # load the dynamic batcher fills each pass with up to 8 requests x 7 questions = 56 rows, so
 # the pass is carrying thousands of tokens and has crossed out of the floor regime into the
-# marginal one (tokens x cost-per-token), where it is bound by weight streaming and
-# arithmetic. There the L40S's 864 GB/s against the L4's 300 GB/s is 2.88x, and the measured
-# 2.7x tracks it almost exactly.
+# marginal one (tokens x cost-per-token).
+#
+# CORRECTION, because the obvious reading of that 2.7x is wrong and it mattered. It is
+# tempting to call a filled pass "memory-bandwidth-bound" because the L40S/L4 bandwidth
+# ratio is 2.88x and the measurement is ~2.9x. That inference does not hold:
+#
+#  * The card-swap CANNOT discriminate. L40S/L4 is 2.88x on bandwidth (864/300 GB/s) and
+#    2.99x on dense BF16 tensor-core throughput (362/121 TFLOPS). Both hypotheses predict
+#    the same ~2.9x, so the experiment distinguishes nothing.
+#  * Weight streaming is NOT the cost. 2B parameters at 2 bytes is 4.0 GB per forward,
+#    which at 864 GB/s is 4.6 ms -- 2.3% of the MEASURED 203.6 ms 56-row pass. A pass that
+#    is 97.7% something-else cannot be bound by weight bandwidth, and that is also why
+#    batching is not nearly free here (see config.pbtxt's max_batch_size note: pass time is
+#    linear in rows at ~3.6 ms/row with no measurable fixed term).
+#  * What it actually is: a 56-row pass pushes ~4,808 input tokens in 203.6 ms = ~23,600
+#    tok/s, which for a 2B model is ~94 TFLOPS, or ~26% of the L40S's dense BF16 peak. So
+#    the pass is arithmetic-shaped but running at about a quarter of the card's peak -- the
+#    gap is kernel efficiency in the eager Gated DeltaNet path, not a bandwidth wall.
+#
+# The practical consequence: the remaining headroom on this card is ~4x in principle and it
+# is reachable only through better kernels (SD_FUSE_LAYERS, CUDA graphs, a compiled torso),
+# NOT through batch geometry, which is already finished.
 #
 # So "this model is dispatch-bound" is true of ONE request and false of a saturated server,
 # and which one you are measuring decides the instance you should buy. The same fact explains
