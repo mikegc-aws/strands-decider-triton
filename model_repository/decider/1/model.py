@@ -375,10 +375,13 @@ class TritonPythonModel:
                  for width in self.GRAPH_WARMUP_BATCHES
                  for tokens in self.GRAPH_WARMUP_TOKENS]
         # Short states with the full production question set stay under DUP_TOKEN_BUDGET,
-        # so they take the one-pass route too and reach row counts past 8 (a 56-row pass is
-        # split by `length_groups` into groups of at most GRAPH_ROWS=16). This is what
-        # produces the 12-row bucket the measured mix contained.
-        plans += [(16, 7, width) for width in (2, 4, 8)]
+        # so they take the one-pass route too and reach row counts past 8: a 7-question
+        # batch of `width` requests is 7*width rows, which `length_groups` splits into
+        # groups of at most GRAPH_ROWS=16 and `count_bucket` then rounds. Every width is
+        # driven because the groups are NOT a simple function of the width -- measured, 3
+        # requests x 7 questions = 21 rows splits 11+10 and lands in the 12-row bucket,
+        # which driving widths 2, 4 and 8 alone missed (19 of 21 shapes instead of 21).
+        plans += [(16, 7, width) for width in self.GRAPH_WARMUP_BATCHES]
         # Kept from the original list: these exceed the duplication budget and so run the
         # ungraphed two-pass route. No graph comes of them, but the fla kernels still
         # compile per shape and that cost is just as real.
