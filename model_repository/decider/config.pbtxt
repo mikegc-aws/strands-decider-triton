@@ -23,18 +23,48 @@ backend: "python"
 
 # Requests the dynamic batcher may coalesce into one execute() call.
 #
-# 8 is now MEASURED, not a starting point. With cross-request batching in the backend
-# (`evaluate_many`), 8 requests x 7 questions = 56 question rows, which fits
-# `BatchedSystemOneEngine.max_rows` (128) in a single pass pair. Raising this to 32 was
-# tried and is WORSE -- 56 decisions/s at concurrency 32 against 101.5 at
-# max_batch_size 8, with server p50 going 611 ms -> 2,031 ms. The Triton log shows why:
-# it occasionally forms batches of 26 requests (182 rows), which exceeds max_rows, gets
-# chunked into two pass pairs anyway, and so buys no extra amortisation while adding
-# queueing delay and activation memory.
+# 8 is MEASURED, and 16 has now been measured too and is NOT better. Raising this to 32 was
+# tried earlier and is much worse -- 56 decisions/s at concurrency 32 against 101.5 at
+# max_batch_size 8, with server p50 going 611 ms -> 2,031 ms -- because Triton formed
+# batches of 26 requests (182 rows), exceeded max_rows, and got chunked into two pass pairs
+# anyway, buying no amortisation while adding queueing delay and activation memory.
 #
-# So the rule is: max_batch_size * typical questions per request should land at or just
-# under max_rows. If callers routinely send 14 questions, drop this to 8 and raise
-# max_rows, or drop this to 4.
+# THE DEEPER REASON, and it says this knob is finished. On an L40S, with max_batch_size
+# fixed at 8 and only the question count varied (so rows per pass = 8 x questions), the
+# per-pass time is PURELY LINEAR in rows -- there is no fixed cost left to amortise:
+#
+#   questions  rows/pass  server p50   ms/row   decisions/s (c=32)
+#       1          8        48.4 ms    6.050        160.1        <- one-pass route
+#       7         56       203.6 ms    3.636        281.4
+#      14        112       410.8 ms    3.668        291.9
+#      28        224       806.4 ms    3.600        292.6
+#
+# Fitting `time = a + b x rows` over the three shared-prefix rows gives a between -3.6 and
+# +15 ms against passes of 204-806 ms, i.e. a fixed cost indistinguishable from ZERO, and
+# b ~= 3.6 ms per row. Rows per second is therefore constant: throughput is FLAT at ~290
+# decisions/s whether a pass carries 56, 112 or 224 rows.
+#
+# The ~45 ms per-pass dispatch floor that motivated widening the batch is real but is a
+# SINGLE-REQUEST phenomenon (the 8-row cell above, at 48.4 ms, is that floor). It is already
+# fully amortised at 56 rows, so there is nothing for a wider batch to recover.
+#
+# Confirmed head-on with a deployed `max_batch_size: 16` (112 rows at 7 questions), same
+# card, same harness, reference_check clean on both:
+#
+#   concurrency        8       32       64      128      192
+#   mbs  8 dec/s    217.0    281.4    291.6    314.3    336.3
+#   mbs 16 dec/s    190.4    258.3    287.0    308.3    325.2
+#   mbs  8 p50      120 ms   203 ms   204 ms   204 ms   204 ms
+#   mbs 16 p50      156 ms   415 ms   415 ms   416 ms   417 ms
+#
+# 16 is 1.6-12% SLOWER at every concurrency and doubles server p50. Keep 8: it is the
+# smallest batch that already sits on the linear part of the curve, so it buys the full
+# amortisation at half the latency.
+#
+# The rule still holds and still matters, because violating it is how you get the 32 result:
+# max_batch_size * typical questions per request should land at or just under max_rows. If
+# callers routinely send 14 questions, 8 x 14 = 112 still fits 128 -- but drop this to 4 if
+# they send 28 or more, or raise SD_MAX_ROWS to match.
 max_batch_size: 8
 
 input [
@@ -61,13 +91,18 @@ dynamic_batching {
   # Try to fill 4 then 8. Preferred sizes are a hint; Triton still dispatches a smaller
   # batch once the queue delay expires.
   #
-  # SUSPECT, and the cheap experiment is `preferred_batch_size: [ 8 ]`. Two cells out of 17
-  # on an L40S came in at 23.4 and 23.7 tickets/s where their neighbours -- and a repeat of
-  # the same cell seconds later -- gave 39-44, with the server-side p50 unchanged at 205 ms
-  # and zero errors. Constant batch cost at ~60% of the throughput means ~60% of the batch
-  # size, i.e. ~5 requests per pass instead of 8, so the batcher appears able to settle on
-  # the smaller of its two targets and stay there for a whole 20-second window. Giving it
-  # one target removes the choice. Not yet diagnosed; see README.md, "Known limits".
+  # `[ 8 ]` alone was MEASURED against this and is a wash under load -- within +-1% at every
+  # saturated concurrency (32/64/128/192: 283.2/294.3/317.1/339.5 decisions/s against
+  # 281.4/291.6/314.3/336.3), reference_check clean, server p50 identical at ~202 ms. The
+  # one real difference is at LOW load, where dropping the 4 costs ~9% (concurrency 4:
+  # 129.8 against 142.1 decisions/s) because a queue of four is no longer a preferred size
+  # and has to wait out max_queue_delay. So keeping the 4 is worth it, and the reason is
+  # latency at thin traffic rather than throughput at saturation.
+  #
+  # It was also tested as a suspect for an apparent BISTABILITY -- cells reading ~60% of
+  # their neighbours at unchanged server p50 and zero errors. It is not the cause. See
+  # tools/bench_tickets.py: the systematic part of that was the load generator charging
+  # per-process startup to a fixed denominator, and it is fixed there.
   preferred_batch_size: [ 4, 8 ]
 
   # 2 ms. The number worth understanding rather than copying: this is pure added latency
@@ -142,50 +177,6 @@ instance_group [
     # vCPU too (ml.g6e.2xlarge is 8 vCPU). Move it together with max_batch_size, so that
     # count x max_batch_size x questions still lands at or just under max_rows; raising
     # count alone is what produced the table above.
-    #
-    # THAT RETEST IS NOW DONE, on the most favourable host the fleet offers: one L40S with
-    # 64 vCPU (ml.g6e.16xlarge), where count: 1 leaves the GPU at 71-80% and uses ~1.5 of
-    # the 64 cores. All three rows are the SAME instance type, harness and load generator;
-    # only the overlaid config.pbtxt differs. Decisions/s:
-    #
-    #     c            count: 1   count: 2    count: 4
-    #       1             69.6       68.6        63.0
-    #       8            210.7      194.6       140.3
-    #      16            273.0      205.1       255.8
-    #      32            273-279    292.2       140.7 (a preferred_batch_size stall)
-    #      64            289.4      303.8       305.6
-    #     128            310.8      325-343     318.8
-    #     192            331.1      353.5       355.6
-    #     256              --       364.7       376.9
-    #   server p50       205 ms   371-392 ms  754-768 ms
-    #   server p95, c=8  141 ms      225 ms     1822 ms
-    #   GPU util         71-80%     93-100%      100%
-    #   GPU memory        14.2%       27.3%      53.8%
-    #
-    # So 1 -> 2 -> 4 copies buys +7% and then +0.6% at the very top of the concurrency
-    # range, is WORSE at every concurrency a latency-sensitive caller would use (0.67x at
-    # c=8 for count: 4), and multiplies the server-side p50 BY THE COUNT, because each
-    # batcher runs its own full 56-row pass against a card it now shares. count: 4's p95 at
-    # c=8 is 13x count: 1's. count: 1 stays the default.
-    #
-    # The utilisation column is again the lesson. count: 2 takes the GPU from 71-80% to
-    # 93-100% and returns 7% more work; count: 4 pins it at 100% and returns nothing
-    # further. The 20-25% of "idle" GPU was not 20-25% of available throughput: a filled
-    # pass is memory-bandwidth-bound, and a second process competing for the same bandwidth
-    # mostly makes both passes slower. The L4's -10% and the L40S's +7% are one mechanism
-    # with different amounts of slack.
-    #
-    # And more vCPU was never the missing ingredient: 16 vCPU and 64 vCPU deliver the same
-    # decisions/s at every concurrency on this card, and both match the 4-vCPU figure at the
-    # same concurrency. The binding constraint is max_batch_size above, not the host. See
-    # README.md, "The L40S ladder".
-    #
-    # TO CHANGE THIS WITHOUT REBUILDING THE 20.6 GB IMAGE: pack the whole decider/ directory
-    # -- this file AND 1/model.py -- into a model.tar.gz and pass it as --model-data-url.
-    # SageMaker extracts it over /opt/ml/model, which is where this repository lives. Take
-    # BOTH files from the commit that built the image: the overlay replaces the model
-    # repository, not the strands_decider package it imports, and a newer model.py against
-    # an older package fails initialize() with a TypeError on load_merged_engine's kwargs.
     count: 1
     kind: KIND_GPU
   }
@@ -224,6 +215,23 @@ parameters [
     # The HF shared-state cache. ON: it is why this engine exists rather than vLLM.
     key: "SD_PREFIX_CACHE"
     value: { string_value: "1" }
+  },
+  {
+    # Question ROWS per forward pass -- `BatchedSystemOneEngine.max_rows`. The partner of
+    # `max_batch_size` above, and it must move WITH it:
+    #
+    #     max_batch_size x typical questions per request <= max_rows
+    #
+    # Overshooting chunks rather than fails, which is the expensive outcome: you pay the
+    # queueing delay to assemble a wide batch and then split it anyway. Raising this raises
+    # activation memory for the whole in-flight batch, so watch GPU memory (the L40S has
+    # 45.8 GB; one stub is ~4.5 GB of weights, so there is room).
+    #
+    # NOTE: a value other than 128 requires an image built from this commit or later.
+    # `model.py::_engine_kwargs` REFUSES to start if the installed strands_decider cannot
+    # honour it, rather than serving 128 while the operator believes otherwise.
+    key: "SD_MAX_ROWS"
+    value: { string_value: "128" }
   },
   {
     # CUDA graph capture. OFF by default. `0` | `1` | `all`.

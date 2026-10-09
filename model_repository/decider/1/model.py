@@ -88,6 +88,25 @@ class TritonPythonModel:
         prefix_cache = param("SD_PREFIX_CACHE", "1") not in ("0", "false", "no", "off")
         device = param("SD_DEVICE", "cuda")
         max_batch = int(param("SD_MAX_BATCH", "32"))
+
+        # How many question ROWS share one forward pass -- `BatchedSystemOneEngine.max_rows`.
+        # Distinct from SD_MAX_BATCH, which chunks ONE request's questions.
+        #
+        # Exposed as a parameter because it is half of a pair that has to move together, and
+        # the other half (`max_batch_size`) already lives in config.pbtxt. The rule, measured
+        # twice from opposite directions:
+        #
+        #     max_batch_size x typical questions per request <= max_rows
+        #
+        # Overshoot does not fail, it CHUNKS -- so you pay the queueing delay to assemble a
+        # wide batch and then split it anyway, buying no amortisation. That is exactly how
+        # `max_batch_size: 32` against max_rows 128 measured 56 decisions/s against 101.5
+        # (server p50 611 ms -> 2,031 ms): Triton formed batches of 26 requests = 182 rows.
+        # Leaving max_rows unreachable from configuration is what made that a rebuild to fix.
+        max_rows = int(param("SD_MAX_ROWS", "128"))
+        if max_rows < 1:
+            raise pb_utils.TritonModelException(
+                f"SD_MAX_ROWS={max_rows} is not a usable row budget; it must be >= 1.")
         # Two independent, opt-in accelerators, both OFF by default because each changes
         # the arithmetic slightly and the eager reference path is what every published
         # number in this repository was measured on. They serve opposite regimes: graphs
@@ -118,13 +137,36 @@ class TritonPythonModel:
         if engine_kind == "merged":
             from strands_decider.merged_engine import load_merged_engine
 
+            # Optional kwargs are filtered against the REAL signature instead of passed
+            # blind, because this file and the installed `strands_decider` version
+            # independently. A SageMaker `ModelDataUrl` overlay untars over
+            # /opt/ml/model, so THIS model.py runs in front of whatever package the image
+            # was built with -- and the newest published image (v23-triton-onepass,
+            # 2026-10-07) predates `fuse_layers`, `cuda_graphs` and `max_rows`.
+            #
+            # Passing an unknown kwarg there does not degrade, it kills the load:
+            #     TypeError: load_merged_engine() got an unexpected keyword argument
+            # `initialize()` raises, Triton never reports ready, /ping never passes, and
+            # SageMaker fails the endpoint ~31 MINUTES later on the health check. That has
+            # happened and it cost a deploy, which is the whole reason this guard exists.
+            #
+            # Silence is not the fallback, though -- see `_engine_kwargs`: an option that
+            # was explicitly turned ON and cannot be honoured RAISES, because serving the
+            # unfused torso after being asked for the fused one would make a benchmark
+            # comparison a lie. Only defaults are allowed to be dropped, with a warning.
+            optional = {
+                "fuse_layers": (fuse_layers, False),
+                "cuda_graphs": (cuda_graphs, False),
+                "cuda_graphs_two_pass": (cuda_graphs_two_pass, False),
+                "max_rows": (max_rows, 128),
+            }
+            extra = self._engine_kwargs(load_merged_engine, optional)
+
             self.engine = load_merged_engine(
                 checkpoint, merged, device=device,
                 use_prefix_cache=prefix_cache, max_batch=max_batch,
                 model_name="strands-decider-triton",
-                fuse_layers=fuse_layers,
-                cuda_graphs=cuda_graphs,
-                cuda_graphs_two_pass=cuda_graphs_two_pass,
+                **extra,
             )
         elif engine_kind == "hf":
             # NOTE: the shipped image does NOT carry `peft`, by design -- the LoRA is
@@ -166,6 +208,52 @@ class TritonPythonModel:
         )
         if param("SD_WARMUP", "1") not in ("0", "false", "no", "off"):
             self._warmup()
+
+    def _engine_kwargs(self, loader, optional: dict) -> dict:
+        """Keep only the optional kwargs `loader` actually accepts.
+
+        `optional` maps a kwarg name to `(requested value, default value)`.
+
+        The split is deliberate and is the whole point:
+
+          * requested == default  -> DROP it if unsupported. Nothing was asked for, so an
+            older engine that cannot do it is already doing what the caller wanted.
+          * requested != default  -> RAISE if unsupported. An operator who set
+            `SD_FUSE_LAYERS=1` or `SD_MAX_ROWS=256` and silently got neither would read the
+            resulting throughput number as evidence about a configuration that was never
+            served. Failing the load says so in the Triton log in seconds instead.
+
+        Signature introspection rather than try/except TypeError, because that exception is
+        indistinguishable from the same error raised *inside* a supported code path, and
+        retrying a partially-constructed 4.5 GB engine load to find out is not free.
+        """
+        import inspect
+
+        accepted = inspect.signature(loader).parameters
+        keep, dropped, refused = {}, [], []
+        for name, (value, default) in optional.items():
+            if name in accepted:
+                keep[name] = value
+            elif value == default:
+                dropped.append(name)
+            else:
+                refused.append(f"{name}={value!r}")
+
+        if refused:
+            raise pb_utils.TritonModelException(
+                f"{loader.__name__}() in the installed strands_decider does not accept "
+                f"{', '.join(refused)}. This model repository is NEWER than the package in "
+                "the image -- the usual cause is a SageMaker ModelDataUrl overlay in front "
+                "of an older container. Rebuild the image from this commit, or unset the "
+                "option. Refusing rather than serving a configuration you did not ask for."
+            )
+        if dropped:
+            self.logger.log_warn(
+                f"[decider] installed strands_decider does not accept {sorted(dropped)}; "
+                "left at its built-in default (each was already off/default here, so "
+                "nothing was silently changed)."
+            )
+        return keep
 
     def _warmup(self) -> None:
         """Compile every shape a caller might hit, before Triton reports the model ready.
