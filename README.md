@@ -89,10 +89,17 @@ A caller inside the same AWS region adds ~8–10 ms. Under load, latency becomes
 at 32 requests in flight a 7-question ticket sits at ~615 ms p50. Autoscaling exists to
 keep you off that.
 
-**Every number above is with CUDA graphs off, which is the default.** Turning them on
-(`SD_CUDA_GRAPHS=1`) takes a 1-question ticket from ~46 ms to **21 ms** and a 2-question one
-from ~48 ms to **30 ms**, and leaves the 7-question figure alone. See
+**Every number above is with both accelerators off, which is the default.** Turning CUDA
+graphs on (`SD_CUDA_GRAPHS=1`) takes a 1-question ticket from ~46 ms to **21 ms** and a
+2-question one from ~48 ms to **30 ms**, and leaves the 7-question figure alone. See
 [Known limits](#known-limits) for why the split falls there.
+
+Both knobs are now also measured **through a served endpoint**, on an L40S, including the
+two of them **on together** — which `v24-accel` (2026-10-09) is the first image to make
+possible. Headline: graphs **2.90x** at one question, fusion **1.16x** at 7-question
+saturation, the two compose, and `both` is the best configuration at every operating point
+except a single-request 7-question ticket. See
+[Both accelerators on a served L40S](#both-accelerators-on-a-served-l40s-v24-accel).
 
 Long states are this deployment's strength: nearly doubling the input (601 → 1,025 tokens)
 costs ~14% of throughput, because the state is paid once per ticket rather than once per
@@ -567,8 +574,8 @@ loud:
 | `preferred_batch_size` | `config.pbtxt` | `[ 4, 8 ]`. `[ 8 ]` alone is a wash at saturation (±1%) and ~9% *worse* at concurrency 4, because a queue of four is then not a preferred size and waits out the queue delay. |
 | `DUP_TOKEN_BUDGET` | `BatchedSystemOneEngine` | 480. Above this many duplicated state tokens, encoding the state once and forking the cache beats a single combined pass. |
 | `SD_ENGINE`, `SD_PREFIX_CACHE` | container env | `merged` folds the LoRA into the torso (no PEFT at runtime). Prefix caching on. |
-| `SD_FUSE_LAYERS` | container env | **0 (off)**. `1` swaps the torso's decoder layers for `flash-linear-attention`'s Triton kernels — see [Fused kernels](#fused-kernels-sd_fuse_layers1) below. Measured **1.29x** on a full 56-row batch (103.8 → 133.7 decisions/s) and *slower* at batch 1. Correctness gates pass; the numbers move. |
-| `SD_CUDA_GRAPHS` | container env | `0`. `1` graphs the one-pass route (1 question 45.9 → 21.5 ms). `all` also graphs the state/row pair, which measured 0.73x–1.02x and is therefore not in `1`. Falls back to eager per shape. See [Known limits](#known-limits). |
+| `SD_FUSE_LAYERS` | container env *and* `config.pbtxt` | **0 (off)**. `1` swaps the torso's decoder layers for `flash-linear-attention`'s Triton kernels — see [Fused kernels](#fused-kernels-sd_fuse_layers1) below. **On a served L40S: 1.16x at 7-question saturation (289.8 → 336.7 decisions/s) and 0.88x at one question, at every concurrency.** A throughput lever, not a latency one. Correctness gates pass; the numbers move by up to ~0.01 on a probability. Needs `v24-accel` or later — no earlier image contains the module. |
+| `SD_CUDA_GRAPHS` | container env *and* `config.pbtxt` | `0`. `1` graphs the one-pass route. **On a served L40S: 2.90x at one question and concurrency 1 (server p50 44.3 → 10.7 ms), 1.47x at one-question saturation, and 1.02x — nothing — at 7 questions**, which is the ungraphed two-pass route. `all` also graphs the state/row pair, which measured 0.73x–1.02x and is therefore not in `1`. Falls back to eager per shape. Needs `v24-accel` or later. See [Known limits](#known-limits) for the warm-up shape gap. |
 
 ## Batch geometry: `max_batch_size` is not the ceiling
 
@@ -693,17 +700,26 @@ Correctness, all three gates green with fusion on:
 
 | check | result |
 | --- | --- |
-| `tools/reference_check.py` | **0 decision mismatches** against the published v21 values (Δ noul 0.0018, Δp 0.0020, Δscore 0.0031) |
-| `tools/batch_parity.py` | **0 decision flips**; max \|Δp\| 0.0086 (0.0064 unfused) |
-| `tools/fused_ab.py`, 80 answers over both readout routes | **0 decision flips**; mean \|Δp\| 0.0011–0.0019, max 0.0102 |
+| `tools/reference_check.py` | **0 decision mismatches** against the published v21 values (Δ noul 0.0018, Δp 0.0020, Δscore 0.0031) — and **0 on a served L40S endpoint** with fusion on, re-run after saturating load |
+| `tools/batch_parity.py` | **0 decision flips**; max \|Δp\| 0.0049 fused against **0.0086 unfused** — see below, the unaccelerated path is the worse one here |
+| `tools/fused_ab.py`, 80 answers over both readout routes | **0 decision flips**; mean \|Δp\| 0.0013–0.0017, max 0.0083 |
 
 The max is above this project's 7e-3 advisory band and the mean is well inside it. `--fp32-reference`
 settles which: run the *same* torso in fp32 as an arbiter and the reference bf16 path sits
-0.00105 from it on average, the fused path 0.00124 — a 1.18x difference, with the
-per-primitive maxima not ordering consistently. Both bf16 paths are about equally close to
-the exact answer; they are simply not close to each other, which is what rounding looks like
-and a systematic kernel error does not. `kev` records the same magnitude for its own bf16
-path on an L40S (max 0.0133, mean 0.0014 from fp32, zero argmax flips).
+0.00104 from it on average, the fused path 0.00131 — a 1.25x difference, with the
+per-primitive maxima **not ordering consistently** (on `noul` the *reference* is the further
+one, 0.0080 against the fused path's 0.0052). Both bf16 paths are about equally close to the
+exact answer; they are simply not close to each other, which is what rounding looks like and
+a systematic kernel error does not. `kev` records the same magnitude for its own bf16 path
+on an L40S (max 0.0133, mean 0.0014 from fp32, zero argmax flips).
+
+**The band is breached by the reference path too, and by more.** `batch_parity.py` compares
+`evaluate_many` against `evaluate` on the *same* engine, and with no accelerators at all
+that reads max \|Δp\| **0.0086** — above 7e-3 — against 0.0049 with fusion on and 0.0074
+with both on. So on this gate the shipped default is the *worst* of the four, and the
+breach belongs to batched-versus-single reassociation (state padding, cache gather, GEMM
+shapes), not to either accelerator. Earlier readings that attributed a band breach to fusion
+were comparing it against a baseline nobody had measured on the same gate.
 
 **But it does move the numbers a caller sees**, by up to ~0.01 on a probability, so it is
 opt-in. Turning it on refuses rather than degrades: `fuse_torso` checks the layer layout and
@@ -773,6 +789,123 @@ load**, with `count: 4` adding nothing further —
 [the L40S result](#instance_group-count-on-an-l40s-7-at-best-n-the-latency-always). More
 vCPU was not the missing ingredient; it was never the constraint.
 
+## Both accelerators, on a served L40S (`v24-accel`)
+
+Everything above about `SD_FUSE_LAYERS` and `SD_CUDA_GRAPHS` was measured **in-process on a
+build box**, because no pushed image contained either module. `v24-accel` (2026-10-09) is
+the first that does, and this is the first measurement of both knobs **through a served
+endpoint** — and the first measurement of the two **on together** anywhere.
+
+Host: one L40S on `ml.g6e.4xlarge`… except it is not. An `--instance-pools`
+`4xlarge → 2xlarge → xlarge → 8xlarge` request landed on **`ml.g6e.8xlarge`**
+(`describe_placement`: `AllTraffic: ml.g6e.8xlarge x1`) in 6½ minutes, because the 4xlarge
+pool had no capacity. **$5.6607/hr, not the 4xlarge's $3.7553.** Same single L40S, twice the
+vCPU — and vCPU is already known not to be the lever here, so the throughput carries over to
+a 4xlarge but the cost per ticket does not. The remaining four deploys were **pinned** to
+`ml.g6e.8xlarge` so the 2×2 is four readings of one card, not four cards.
+
+Method: dedicated in-region `c7i.8xlarge` load generator (32 vCPU), `bench_tickets.py
+--sections 4`, distinct tickets from a pool of 64, 20 s per cell, **each cell run twice and
+the second reading reported**. `reference_check.py --endpoint` clean on all four
+configurations.
+
+### Decisions per second
+
+| | 1 question, c=1 | c=16 | c=64 | 7 questions, c=1 | c=16 | c=64 |
+| --- | --- | --- | --- | --- | --- | --- |
+| neither (shipped default) | 19.2 | 156.4 | 160.5 | 67.9 | 273.0 | 289.8 |
+| `SD_CUDA_GRAPHS=1` | 55.6 | 233.9 | 236.1 | 71.0 | 281.4 | 295.4 |
+| `SD_FUSE_LAYERS=1` | 16.8 | 137.3 | 140.1 | 59.1 | 322.7 | 336.3 |
+| **both** | **62.1** | **256.6** | **262.5** | 59.9 | **322.3** | **336.7** |
+| | **3.23x** | **1.64x** | **1.64x** | 0.88x | **1.18x** | **1.16x** |
+
+Server p50 / end-to-end p50, milliseconds:
+
+| | 1q c=1 | 1q c=64 | 7q c=1 | 7q c=16 | 7q c=64 |
+| --- | --- | --- | --- | --- | --- |
+| neither | 44.3 / 52.0 | 49.0 / 404.3 | 95.7 / 104.2 | 206.5 / 416.4 | 205.8 / 1662.3 |
+| graphs | 10.7 / 17.9 | 30.8 / 274.1 | 91.9 / 99.6 | 200.0 / 403.6 | 200.5 / 1620.3 |
+| fused | 51.9 / 59.7 | 56.5 / 464.1 | 111.9 / 120.0 | 174.0 / 351.3 | 175.3 / 1417.9 |
+| both | 8.7 / 16.0 | 29.0 / 246.0 | 110.4 / 118.5 | 174.8 / 353.6 | 174.5 / 1412.0 |
+
+### What this settles
+
+- **The two accelerators compose, and they do not overlap.** Graphs own the
+  dispatch-bound regime, fusion owns the arithmetic-bound one, and `both` gets each win
+  where that win exists: 3.23x at one question and 1.16x at seven, in one configuration.
+  Nothing cancels — `both` is within 0.4% of `fused` at 7 questions and within 2% of
+  `graphs`-plus-its-own-gain at one.
+- **Fusion does deliver on an arithmetic-bound card, but less than on an L4: 1.16x at
+  c=64, against 1.29x measured in-process on an L4.** The direction of the prediction was
+  right; the magnitude was optimistic. An L40S has ~2.9x the L4's bandwidth, so there is
+  less bandwidth pressure for fusion to relieve — the lever it pulls hardest is the one this
+  card needed least.
+
+  **The throughput ratio overstates it, and the pass time is the honest number.** This
+  sweep stopped at c=64, and [the operating-point ladder
+  above](#operating-point-not-just-peak) shows the *unaccelerated* server reaching 336.3
+  decisions/s at c=192 — the same figure `both` reaches at c=64. So "1.16x" is partly
+  fusion reaching the ceiling at a quarter of the concurrency, and a c=192 column would
+  shrink the ratio. What is *not* ambiguous is the cost of one full pass, which is what
+  `latency_ms` measures once the batcher is always full: **205.8 → 174.5 ms, a 1.18x
+  faster 56-row pass**. That is a real gain in the work itself rather than in the queue,
+  and it is the number to carry forward. A c=192 reading of all four cells is the obvious
+  missing measurement.
+- **Fusion's batch-1 penalty is real and now measured through HTTP: 0.88x**, matching the
+  0.85x in-process figure. It costs at *every* 1-question point (0.88x at c=1, c=16 and
+  c=64 alike) and at 7q/c=1 (0.88x). It is a throughput lever only.
+- **Graphs beat their own prediction at one question and have a second effect nobody
+  looked for.** 2.90x at c=1 against the ~2x expected (server p50 44.3 → 10.7 ms), and
+  **1.47x at one-question saturation** — the published claim was about single-request
+  latency only. At seven questions they are 1.02x, exactly as predicted: that route is the
+  two-pass one, which `SD_CUDA_GRAPHS=1` deliberately does not graph.
+
+### Cost, and the operating point
+
+`$`/1,000 tickets on the `ml.g6e.8xlarge` that was actually placed ($5.6607/hr), with the
+`ml.g6e.4xlarge` projection in brackets (same single L40S, $3.7553/hr):
+
+| | neither | both |
+| --- | --- | --- |
+| 7 questions, c=16 | $0.0403 [$0.0268] | **$0.0341 [$0.0227]** |
+| 7 questions, c=64 | $0.0380 [$0.0252] | **$0.0327 [$0.0217]** |
+| 1 question, c=64 | $0.0098 [$0.0065] | **$0.0060 [$0.0040]** |
+| 1 question, c=1 | $0.0819 [$0.0543] | **$0.0253 [$0.0168]** |
+
+**Recommended operating point: 7 questions at concurrency ~16, both knobs on.** That is 322
+decisions/s at an end-to-end p50 of **354 ms**. Concurrency 64 buys 4% more throughput for
+**4x** the end-to-end latency (1,412 ms) — the batch is already full at c=16, so the extra
+63 requests are queue, not work. This is the reading `latency_ms` cannot give you: server
+p50 is *flat* at ~175 ms across c=16 and c=64 precisely because the batcher is always full.
+
+### The load generator was not the limit
+
+Required before any of the above counts. At the saturating point, doubling `--processes` at
+identical offered load moved throughput by less than noise, and client CPU never exceeded
+1.5%:
+
+| | p=16 | p=32 | move |
+| --- | --- | --- | --- |
+| neither, 7q c=64 | 289.8 | 289.8 | 0.0% |
+| fused, 7q c=64 | 333.6 | 331.8 | −0.5% |
+| both, 7q c=64 | 334.6 | 331.8 | −0.8% |
+| both, 1q c=64 | 260.5 | 257.4 | −1.2% |
+
+Zero errors in every reported cell.
+
+### A measurement trap in the grid itself
+
+The first **loaded 7-question** cell of a fresh sweep reads low, in every configuration,
+and it is shape compilation bleeding into a 20 s window rather than anything about the
+server. Measured: 149.8 decisions/s on the first pass against 273.0 on the second
+(unaccelerated); with fusion on, the first pass stalled to a **20–24 s server p50 with 4–5
+errors**. The tell is that the depressed cells report a *healthy* p50 and e2e p50 that are
+arithmetically inconsistent with their own throughput — 16 in flight at 352 ms is ~45
+tickets/s, and one such cell reported 11.4. Re-measured in isolation the same cell was flat
+at 317–323 decisions/s across `--processes 1, 2, 4, 8, 16`.
+
+Hence "each cell twice, report the second". Every number above is a second reading.
+
 ## Known limits
 
 - **`latency_ms` does not include the queue, so it cannot tell you whether the server is
@@ -797,11 +930,37 @@ vCPU was not the missing ingredient; it was never the constraint.
   205 ms and zero errors. A constant batch cost at 60% of the throughput means 60% of the
   batch size, i.e. ~5 requests per pass instead of 8. Not diagnosed; the cheap experiment is
   `preferred_batch_size: [ 8 ]`, so the batcher has one target instead of two.
-- **No pushed image supports `SD_FUSE_LAYERS` or `SD_CUDA_GRAPHS`.** Both knobs are read by
-  `model.py` and both were added *after* the newest image in ECR
-  (`v23-triton-onepass`, 2026-10-07) was built, so the fused-kernel and CUDA-graph numbers
-  in this README are in-process measurements from the build box and **have never been
-  measured through a deployed endpoint**. Doing so needs a rebuild.
+- ~~**No pushed image supports `SD_FUSE_LAYERS` or `SD_CUDA_GRAPHS`.**~~ **Fixed by
+  `v24-accel` (2026-10-09)**, the first image containing either module, and both knobs are
+  now measured through a served endpoint — see
+  [Both accelerators on a served L40S](#both-accelerators-on-a-served-l40s-v24-accel).
+  Keeping the entry because of *how* it failed: on `v23-triton-onepass` the knobs were not
+  merely ineffective, they were read by nothing at all. Verified by inspecting both images
+  side by side — v23 has no `fused_layers.py` and no `cuda_graphs.py`, its `model.py` does
+  not mention either variable, and its `load_merged_engine` accepts neither `fuse_layers`
+  nor `cuda_graphs`. So `--env SD_FUSE_LAYERS=1` against it produced a healthy endpoint
+  serving the unaccelerated torso, with no warning anywhere. Two agents in a row believed
+  the resulting throughput numbers; one lost ~$5 and 35 minutes to it. `model.py` now
+  refuses to start in that situation (`_engine_kwargs`), which is what makes this
+  non-recurring — but the refusal only exists in images built from that commit onward, so
+  **check the image, not the config**:
+  `docker run --rm --entrypoint ls <image> /opt/strands-decider/strands_decider/`.
+- **The CUDA-graph warm-up pre-captures 4 shapes; real traffic produces 21.** Measured
+  in-process on an L4 and confirmed twice on a live L40S endpoint, which logged
+  `cuda graphs after warm-up: {'captured': 4, 'pending': 0}` and then climbed to 12
+  (graphs) and 13 (graphs + fusion) over the next two minutes of load, capturing in-line
+  with the queue behind it. A bucket's key is
+  `(route, count_bucket(rows), bucket(longest))` — the row *count* is half of it — and the
+  warm-up drove one request per call, so it only ever produced row counts 1 and 3 where
+  Triton's batcher produces 1, 2, 3, 4, 6, 8 and 12. **Fixed in `model.py`
+  (`GRAPH_WARMUP_BATCHES`), verified at 21/21 with 0 pending**, at the cost of taking the
+  graph warm-up from 12.3 s to 30.0 s — all of it before Triton reports ready. The
+  `v24-accel` image **predates that fix**, because the fix came out of measuring it; ship
+  it as a `--model-data-url` overlay or rebuild. What it cost while broken: the first
+  loaded 7-question cell ran at 0.59–0.82x of warm throughput, and with fusion on its first
+  pass stalled to a 20–24 s server p50 with 4–5 errors against the 30 s `REJECT` policy. An
+  earlier report of 0.22x and 120 errors at c=128 is consistent with this and was not
+  reproduced at c=64.
 - **A model-repository overlay replaces the repository, not the package it imports.**
   `--model-data-url` is extracted over `/opt/ml/model`, so the `decider/1/model.py` in the
   archive must be the same vintage as the `strands_decider` baked into the image. Shipping
@@ -894,10 +1053,15 @@ vCPU was not the missing ingredient; it was never the constraint.
   fixed (64 MiB for the one-pass route, 1,188 MiB with the bank), so on a card shared with
   anything else capture can fail with CUDA OOM — in which case it says so, stops trying,
   and runs eagerly.
-- **The two regimes reward opposite optimisations.** Fused kernels (`SD_FUSE_LAYERS=1`) do
-  less arithmetic and move less data but carry more Python per op, so they help a full pass
-  (1.07-1.42x at 56 rows) and *hurt* a small one (0.85x at batch 1). Choose for the regime
-  you are in.
+- **The two regimes reward opposite optimisations, and you do not have to choose.** Fused
+  kernels (`SD_FUSE_LAYERS=1`) do less arithmetic and move less data but carry more Python
+  per op, so they help a full pass (1.07-1.42x at 56 rows in-process; **1.18x on a served
+  L40S's 56-row pass time**) and *hurt* a small one (0.85x in-process, **0.88x served**).
+  CUDA graphs are the mirror image: **2.90x** on a served one-question request, **1.02x —
+  nothing — at seven**. Measured on together, the two **compose** rather than conflict, so
+  `SD_FUSE_LAYERS=1 SD_CUDA_GRAPHS=1` is the right default for a mixed workload and the
+  only point it loses is a single-request 7-question ticket (0.88x). See
+  [Both accelerators on a served L40S](#both-accelerators-on-a-served-l40s-v24-accel).
 - **`instance_group count: 2` is measured and buys nothing.** It is neutral when
   `max_batch_size` moves with it and 10% worse when it does not; `count: 4` loses ~8% even
   with rows held constant. See [above](#instance_group-count-measured-1-wins).
