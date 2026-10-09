@@ -307,14 +307,47 @@ class TritonPythonModel:
             f"{time.perf_counter() - started:.1f}s")
         self._warmup_graphs(noul, choice, score)
 
+    # Triton batch widths to warm the graph buckets at. These are `count_bucket`'s own
+    # steps up to `max_batch_size` (1, 2, 3, 4, 6, 8), so one entry per distinct ROW-COUNT
+    # bucket a full batcher can form and not one capture more.
+    #
+    # MEASURED, and the reason this list exists at all. A graph bucket's key is
+    # `(route, count_bucket(rows), bucket(longest))` -- the row COUNT is half the key. The
+    # previous warm-up drove `evaluate_many([request])`, one request per call, so it only
+    # ever produced row counts 1 and 3 and captured **4** shapes. Driving the batch widths
+    # Triton actually coalesces produces **21**. The 17 it missed were then captured
+    # in-line under load, single-threaded, while requests queued into the 30 s REJECT
+    # policy in config.pbtxt: one measurement of that state was 0.22x throughput and 120
+    # errors at c=128, then 130/130 OK once warm. The shapes were enumerated on an L4 from
+    # the real engine rather than derived, because `length_groups` decides the row grouping
+    # and re-deriving it here would be a second implementation of it.
+    GRAPH_WARMUP_BATCHES = (1, 2, 3, 4, 6, 8)
+
+    # State lengths to warm each batch width at, as approximate token counts. These land in
+    # `bucket()` steps 80/96/320/640 -- the four length buckets the measured traffic mix
+    # produced inside the graphed envelope (`GRAPH_COMBINED` is 1,024). 900 is kept for the
+    # kernel warm-up it still does on the ungraphed two-pass route.
+    GRAPH_WARMUP_TOKENS = (16, 256, 600)
+
     def _warmup_graphs(self, noul, choice, score) -> None:
         """Drive `evaluate_many` so the CUDA-graph buckets are captured before readiness.
 
         The sweep above goes through `evaluate`, which never touches `evaluate_many` and so
-        never reaches a graph. Capturing costs ~0.4 s per shape, and a bucket is only
+        never reaches a graph. Capturing costs ~0.4 s per shape idle, and a bucket is only
         captured after it has run eagerly `HOT_BUCKET` times -- so each shape is driven a
         few times here and then captured, rather than leaving the first real caller of each
         shape to pay for it. No-op when graphs are off: `capture_pending` returns 0.
+
+        The batch WIDTHS matter as much as the state lengths, which is what the earlier
+        version of this method got wrong -- see `GRAPH_WARMUP_BATCHES`. A warm-up that only
+        ever submits one request at a time leaves most of a loaded server's shapes to be
+        captured under load, and this method exists precisely so that does not happen.
+
+        Each request in a batch carries a DISTINCT state, as distinct tickets do. That is
+        not cosmetic: `BatchedSystemOneEngine.DUP_TOKEN_BUDGET` sends a batch with heavily
+        shared state to the two-pass route instead, which `SD_CUDA_GRAPHS=1` does not graph
+        at all -- so a warm-up built from one repeated state would drive the wrong route
+        and capture nothing for the one it was trying to warm.
         """
         from strands_decider.schema import SystemOneRequest
 
@@ -322,25 +355,44 @@ class TritonPythonModel:
         if not hasattr(engine, "capture_pending"):
             return
         started = time.perf_counter()
-        # Both routes, across the state lengths the envelope covers: few questions take the
-        # one-pass (combined) graph, several take the state+rows pair. 7 is the shape the
-        # published latency numbers use.
-        plans = [(16, 1), (16, 3), (256, 1), (256, 3), (256, 7), (600, 7), (900, 7)]
         questions = {"a": noul, "b": choice, "c": score,
                      "d": noul, "e": choice, "f": score, "g": noul}
         names = list(questions)
-        for approx_tokens, n in plans:
-            state = "warm up the kernels for this state length. " * max(
-                1, approx_tokens // 10)
-            request = SystemOneRequest(
-                state=state, questions={k: questions[k] for k in names[:n]})
+
+        def batch(approx_tokens: int, n_questions: int, width: int) -> list:
+            return [
+                SystemOneRequest(
+                    # The index makes each state distinct; the repeat makes it the right
+                    # length. Both are load-bearing -- see the docstring on duplication.
+                    state=("warm up the kernels for this state length. "
+                           * max(1, approx_tokens // 10)) + f" ticket {i} ",
+                    questions={k: questions[k] for k in names[:n_questions]})
+                for i in range(width)
+            ]
+
+        # (approx state tokens, questions per request, requests per batch).
+        plans = [(tokens, 1, width)
+                 for width in self.GRAPH_WARMUP_BATCHES
+                 for tokens in self.GRAPH_WARMUP_TOKENS]
+        # Short states with the full production question set stay under DUP_TOKEN_BUDGET,
+        # so they take the one-pass route too and reach row counts past 8 (a 56-row pass is
+        # split by `length_groups` into groups of at most GRAPH_ROWS=16). This is what
+        # produces the 12-row bucket the measured mix contained.
+        plans += [(16, 7, width) for width in (2, 4, 8)]
+        # Kept from the original list: these exceed the duplication budget and so run the
+        # ungraphed two-pass route. No graph comes of them, but the fla kernels still
+        # compile per shape and that cost is just as real.
+        plans += [(256, 7, 1), (600, 7, 1), (900, 7, 1)]
+
+        for approx_tokens, n, width in plans:
+            requests = batch(approx_tokens, n, width)
             for _ in range(3):  # > HOT_BUCKET, so the bucket is hot enough to capture
                 try:
-                    engine.evaluate_many([request])
+                    engine.evaluate_many(requests)
                 except Exception as exc:
                     self.logger.log_warn(
                         f"[decider] graph warm-up failed at ~{approx_tokens} tokens, "
-                        f"{n} question(s): {exc}")
+                        f"{n} question(s) x {width} request(s): {exc}")
                     break
             engine.capture_pending()
         stats = getattr(engine, "graph_stats", dict)()
@@ -348,6 +400,16 @@ class TritonPythonModel:
             self.logger.log_info(
                 f"[decider] cuda graphs after warm-up: {stats} in "
                 f"{time.perf_counter() - started:.1f}s")
+            # Said out loud rather than left in a dict: a shape still pending here is one a
+            # real caller will pay ~3.3 s to capture, in-line, with the queue filling
+            # behind it. That is the failure this method exists to prevent, so if it is
+            # still happening the log should say so rather than look healthy.
+            if stats.get("pending"):
+                self.logger.log_warn(
+                    f"[decider] {stats['pending']} graph shape(s) still uncaptured after "
+                    "warm-up; the first caller of each will pay the capture under load. "
+                    "Add its batch width to Decider.GRAPH_WARMUP_BATCHES or its state "
+                    "length to GRAPH_WARMUP_TOKENS.")
 
     def _assert_fla_on_gpu(self, device: str) -> None:
         """Refuse to start if the Gated DeltaNet layers are on the CPU reference path.

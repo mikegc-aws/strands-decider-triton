@@ -467,3 +467,100 @@ def test_refusal_mentions_every_unsupported_request(batched_model):
             "fuse_layers": (True, False), "max_rows": (256, 128)})
     assert "fuse_layers=True" in str(exc.value)
     assert "max_rows=256" in str(exc.value)
+
+
+# ------------------------------------------------- CUDA-graph warm-up coverage
+#
+# A graph bucket's key is `(route, count_bucket(rows), bucket(longest))`, so the batch
+# WIDTH warm-up drives is half of what it covers. The first version of `_warmup_graphs`
+# submitted `evaluate_many([request])` -- one request per call -- and therefore only ever
+# produced row counts 1 and 3.
+#
+# MEASURED on an L4 against the real engine: that captured 4 shapes where the traffic mix a
+# full batcher produces needs 21. The other 17 were captured in-line under load at ~3.3 s
+# each, single-threaded, while requests queued into the 30 s REJECT policy -- measured once
+# as 0.22x throughput and 120 errors at c=128, then 130/130 OK on the same endpoint warm.
+#
+# These tests pin the properties that made the difference, not the shape count, because the
+# count depends on `length_groups` and the envelope constants and should be free to move.
+
+
+class _RecordingEngine:
+    """Records the batch widths and question counts `_warmup_graphs` drives."""
+
+    def __init__(self):
+        self.calls = []          # (width, questions, distinct states)
+        self.captures = 0
+
+    def evaluate_many(self, requests):
+        states = {r.state for r in requests}
+        self.calls.append((len(requests), len(requests[0].questions), len(states)))
+        return [None] * len(requests)
+
+    def capture_pending(self, limit=None):
+        self.captures += 1
+        return 0
+
+    def graph_stats(self):
+        return {"captured": len(self.calls), "pending": 0}
+
+
+@pytest.fixture
+def warmup_recorder():
+    pytest.importorskip("pydantic")
+    from strands_decider.schema import ChoiceQuestion, NoulQuestion, ScoreQuestion
+
+    engine = _RecordingEngine()
+    model = _build(engine)
+    model._warmup_graphs(
+        NoulQuestion(instructions="warm?"),
+        ChoiceQuestion(instructions="which?", criteria={"a": "x", "b": "y"}),
+        ScoreQuestion(instructions="how warm?", criteria=["cold", "warm"]))
+    return engine
+
+
+def test_graph_warmup_drives_every_triton_batch_width(warmup_recorder):
+    """Every width `count_bucket` distinguishes up to max_batch_size must be driven.
+
+    A width that is never driven is a row-count bucket that is never captured, and the
+    first real caller to form that batch pays the capture with the queue behind it.
+    """
+    widths = {w for w, _q, _s in warmup_recorder.calls}
+    expected = set(_load_model_module().TritonPythonModel.GRAPH_WARMUP_BATCHES)
+    assert expected <= widths, f"never driven: {sorted(expected - widths)}"
+    # The specific regression: a warm-up that only ever submits one request.
+    assert widths != {1}, "warm-up drove one request at a time; that captured 4 of 21 shapes"
+    assert max(widths) >= 8, "max_batch_size is 8, so a batch of 8 must be warmed"
+
+
+def test_graph_warmup_batches_carry_distinct_states(warmup_recorder):
+    """Within a multi-request warm-up batch, the states must differ.
+
+    Not cosmetic. `DUP_TOKEN_BUDGET` routes a batch with heavily shared state to the
+    two-pass route, which `SD_CUDA_GRAPHS=1` does not graph at all -- so a warm-up built
+    from one repeated state would drive the wrong route and capture nothing for the one it
+    was trying to warm.
+    """
+    for width, _questions, states in warmup_recorder.calls:
+        if width > 1:
+            assert states == width, (
+                f"a {width}-request warm-up batch carried {states} distinct state(s); "
+                "shared state sends it to the ungraphed two-pass route")
+
+
+def test_graph_warmup_covers_both_question_regimes(warmup_recorder):
+    """One question and the production set of seven, which take different routes."""
+    counts = {q for _w, q, _s in warmup_recorder.calls}
+    assert 1 in counts, "the one-question route is where graphs measured 2x"
+    assert 7 in counts, "7 is the production question set and the published latency shape"
+
+
+def test_graph_warmup_captures_after_each_plan(warmup_recorder):
+    """`capture_pending` once per plan, not once at the end.
+
+    Buckets are captured hottest-first and the buffers are shared, so capturing as each
+    shape goes hot keeps the pending set small instead of leaving one long capture storm
+    at the end of initialize() -- which is still before readiness, but makes a timeout
+    there much harder to attribute.
+    """
+    assert warmup_recorder.captures >= len(set(warmup_recorder.calls))

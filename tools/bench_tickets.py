@@ -376,9 +376,10 @@ def main() -> int:
                          "signing and JSON parsing hold the GIL, and a client at its "
                          "ceiling measures itself rather than the endpoint")
     ap.add_argument("--sections", default="1,2,3",
-                    help="which of the three sweep sections to run; '1' is the "
-                         "concurrency sweep alone, which is what a ladder across instance "
-                         "types needs and costs a third of the GPU minutes")
+                    help="which sweep sections to run; '1' is the concurrency sweep alone, "
+                         "which is what a ladder across instance types needs and costs a "
+                         "third of the GPU minutes. '4' is the --qcounts x --concurrency "
+                         "grid, for comparing a configuration knob across both regimes")
     ap.add_argument("--out", default="")
     args = ap.parse_args()
 
@@ -453,6 +454,22 @@ def main() -> int:
         for name, tix in (("plain", pool), ("with_document", docs)):
             for conc in (1, 8):
                 rows.append(cell(f"{name}/7q", tix, questions(7), conc))
+
+    if "4" in sections:
+        # The grid sections 1 and 2 between them cannot produce: section 1 is 7 questions
+        # at every concurrency, section 2 is every question count at concurrency 1, and
+        # neither gives a low question count UNDER LOAD.
+        #
+        # That cell is the one an accelerator comparison turns on. CUDA graphs remove a
+        # per-pass CPU dispatch floor, which is most of a one-question request and almost
+        # none of a seven-question one; fused kernels do the opposite, paying off only once
+        # a pass is wide enough to be arithmetic-bound. Measuring a knob at 7q/c=1 and
+        # 1q/c=1 only would miss both effects.
+        print("\n=== 4. questions x concurrency grid "
+              "(a knob's effect in the dispatch-bound and saturated regimes)", flush=True)
+        for nq in [int(q) for q in args.qcounts.split(",")]:
+            for conc in [int(c) for c in args.concurrency.split(",")]:
+                rows.append(cell(f"plain/{nq}q", pool, questions(nq), conc))
 
     if args.out:
         with open(args.out, "w") as fh:
