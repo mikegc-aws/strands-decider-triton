@@ -6,12 +6,20 @@
 # them that module `importorskip`s itself and 17 tests silently pass as a skip, which is
 # worse than failing -- the gather is the part that, if wrong, answers one caller's
 # question from another caller's state.
+# httpx is imported at module scope by `tools/loadsweep_triton.py`, which
+# `test_deploy.py::test_entry_point_parser_builds` imports to prove its argparse parser
+# assembles. It used to arrive transitively via huggingface_hub and so was never declared.
+# That stopped being true: hub 1.33 depends on `httpx<1`, hub 2.2 depends on `httpx2<3` --
+# a DIFFERENT distribution -- so once the resolver moved to 2.x the import vanished and the
+# test failed on a file nobody had touched. Declared directly, because the tool really does
+# need it and a transitive dependency is not a promise.
 pytest>=8.0
 ruff>=0.6
 pydantic>=2.7
 numpy>=1.24
 fastapi>=0.115
 boto3>=1.34
+httpx>=0.23
 torch>=2.5
 transformers>=4.40
 huggingface_hub>=0.23
