@@ -17,7 +17,11 @@ import json
 
 import pytest
 
-from strands_decider.modeling import StrandsDeciderConfig
+from strands_decider.modeling import (
+    TEXT_TOWER_CLASSES,
+    StrandsDeciderConfig,
+    assert_bos_contract,
+)
 
 # v21 (deployed today) and 2B-qwen3.5-v1-2610 publish byte-identical key sets.
 SHIPPED_KEYS = [
@@ -67,33 +71,139 @@ def test_max_length_is_read_from_the_file_not_the_dataclass_default():
     assert StrandsDeciderConfig().max_length == 3072
 
 
-def test_the_gemma4_key_set_is_refused_loudly(tmp_path):
-    """The four gemma4-2610 releases cannot be loaded, and that refusal is correct.
+def test_the_gemma4_key_set_loads(tmp_path):
+    """The four gemma4-2610 releases parse, with the three extra keys given meanings.
 
-    This is a *characterisation* test, not an endorsement: it exists so that whoever adds
-    gemma4 support has to come here and decide what the three keys MEAN, rather than
-    making the error go away. In particular:
+    This test used to assert the opposite -- that the key set was refused with a
+    `TypeError` -- as a characterisation of the state before gemma4 support, and it said
+    whoever added that support had to come here and decide what the three keys MEAN rather
+    than make the error go away. That is what happened:
 
       * `full_weight_targets` and `host_embeddings` are training-side and inert at
-        inference -- safe to accept and ignore.
-      * `force_bos` is NOT. It is `true` on all four gemma4 configs, and nothing in this
-        repo reads it. The state happens to get a BOS because `infer.py` tokenises it with
-        `add_special_tokens=True`, but the question suffix is deliberately tokenised with
-        `add_special_tokens=False`. So adding these as ignored fields would make the
-        configs load while quietly dropping a flag the checkpoint asserts.
-
-    The 2B-qwen3.5-v1-2610 publisher stripped all three *because each held its off value*
-    and said so in that repo's README. For gemma4 one of them does not, so the same move
-    is not safe. Confirm the flag's semantics against the training code first.
+        inference. Declared so they round-trip, read by nothing.
+      * `force_bos` is NOT inert, and is `true` on all four. It is now enforced by
+        `assert_bos_contract` at load rather than satisfied by coincidence -- see the
+        tests below.
     """
-    path = _write(tmp_path, SHIPPED_KEYS + GEMMA4_EXTRA_KEYS)
-    with pytest.raises(TypeError, match=r"full_weight_targets|force_bos|host_embeddings"):
-        StrandsDeciderConfig.from_json(path)
+    cfg = StrandsDeciderConfig.from_json(_write(tmp_path, [*SHIPPED_KEYS, *GEMMA4_EXTRA_KEYS]))
+    assert cfg.force_bos is True
+    assert cfg.full_weight_targets == []
+    assert cfg.host_embeddings is False
+    # The serving-relevant fields must survive alongside the new ones.
+    assert cfg.head_type == "pointer"
+    assert cfg.max_length == 4096
 
 
-@pytest.mark.parametrize("extra", GEMMA4_EXTRA_KEYS)
-def test_each_unknown_key_is_refused_individually(tmp_path, extra):
-    """Pins which keys are unknown one at a time, so adding support for one does not
-    silently appear to add support for all three."""
-    with pytest.raises(TypeError, match=extra):
-        StrandsDeciderConfig.from_json(_write(tmp_path, [*SHIPPED_KEYS, extra]))
+def test_force_bos_defaults_off_so_existing_checkpoints_are_unaffected(tmp_path):
+    """v21 and qwen3.5-v1 do not publish the key at all. They must not acquire a contract
+    they never asserted, because `assert_bos_contract` is a startup failure when unmet."""
+    cfg = StrandsDeciderConfig.from_json(_write(tmp_path, SHIPPED_KEYS))
+    assert cfg.force_bos is False
+    assert cfg.full_weight_targets == []
+    assert cfg.host_embeddings is False
+
+
+def test_a_genuinely_unknown_key_is_still_refused(tmp_path):
+    """Accepting the three gemma4 keys must not turn `from_json` permissive.
+
+    Strictness is the feature: a key this code does not understand is a checkpoint making
+    an assertion nobody is honouring, and the `TypeError` at build time is how that gets
+    noticed. Only the three keys whose meanings were established are allowed through.
+    """
+    with pytest.raises(TypeError, match="speculative_decoding_depth"):
+        StrandsDeciderConfig.from_json(
+            _write(tmp_path, SHIPPED_KEYS, speculative_decoding_depth=4))
+
+
+# ---------------------------------------------------------------------------
+# force_bos, held to its word
+# ---------------------------------------------------------------------------
+
+
+class _Tok:
+    """Minimal stand-in for a fast tokeniser's call + bos_token_id."""
+
+    def __init__(self, bos_token_id, prepends):
+        self.bos_token_id = bos_token_id
+        self._prepends = prepends
+
+    def __call__(self, text, add_special_tokens=True):
+        ids = [101, 102, 103]
+        if add_special_tokens and self._prepends:
+            ids = [self.bos_token_id, *ids]
+        return {"input_ids": ids}
+
+
+def test_bos_contract_is_a_no_op_when_the_checkpoint_does_not_ask():
+    """v21 and qwen3.5-v1 must be unaffected, including with a BOS-less tokeniser."""
+    cfg = StrandsDeciderConfig(force_bos=False)
+    assert_bos_contract(cfg, _Tok(bos_token_id=None, prepends=False))
+
+
+def test_bos_contract_passes_when_the_tokeniser_supplies_one():
+    """A Gemma tokeniser prepends <bos> under add_special_tokens=True. Verified, not
+    assumed: that is the whole point of the check."""
+    assert_bos_contract(StrandsDeciderConfig(force_bos=True),
+                        _Tok(bos_token_id=2, prepends=True))
+
+
+def test_bos_contract_refuses_a_tokeniser_that_declares_no_bos():
+    cfg = StrandsDeciderConfig(force_bos=True)
+    with pytest.raises(RuntimeError, match="no bos_token_id"):
+        assert_bos_contract(cfg, _Tok(bos_token_id=None, prepends=False))
+
+
+def test_bos_contract_refuses_a_tokeniser_that_will_not_prepend():
+    """The case that would otherwise serve, silently, without the leading token the
+    checkpoint requires -- changing every probability and raising nowhere."""
+    cfg = StrandsDeciderConfig(force_bos=True)
+    with pytest.raises(RuntimeError, match="rather than starting with bos_token_id"):
+        assert_bos_contract(cfg, _Tok(bos_token_id=2, prepends=False))
+
+
+# ---------------------------------------------------------------------------
+# The text-tower table
+# ---------------------------------------------------------------------------
+
+
+# Every base model across the six published checkpoints, from their `base_model` fields.
+PUBLISHED_MODEL_TYPES = {
+    "qwen3_5": "Qwen/Qwen3.5-2B-Base (v21, qwen3.5-v1)",
+    "gemma4": "google/gemma-4-{E2B,E4B,26B-A4B}-it",
+    "gemma4_unified": "google/gemma-4-12B-it",
+}
+
+
+@pytest.mark.parametrize("model_type", sorted(PUBLISHED_MODEL_TYPES))
+def test_every_published_architecture_has_a_text_tower_class(model_type):
+    """A `model_type` absent from the table falls through to `AutoModel`, which for these
+    multimodal checkpoints returns the wrapper -- and PEFT reports the resulting name
+    mismatch as an EMPTY MERGE rather than an error. So a missing entry is a silently
+    un-adapted model, not a crash."""
+    assert model_type in TEXT_TOWER_CLASSES, (
+        f"{model_type} ({PUBLISHED_MODEL_TYPES[model_type]}) would load via AutoModel")
+
+
+@pytest.mark.parametrize("model_type", sorted(PUBLISHED_MODEL_TYPES))
+def test_the_named_class_exists_and_exposes_a_text_tower(model_type):
+    """The table names classes; this proves the installed transformers has them, and that
+    `.model` is the text tower whose layers sit at `.layers` -- which is what makes the
+    adapters' `base_model.model.layers.N` paths line up."""
+    transformers = pytest.importorskip("transformers")
+    cls_name = TEXT_TOWER_CLASSES[model_type]
+    cls = getattr(transformers, cls_name, None)
+    assert cls is not None, (
+        f"transformers {transformers.__version__} has no {cls_name}; the image pins "
+        "transformers 5.18, where it is present")
+    # The text config is where hidden_size lives -- the wrapper config has none, which is
+    # the loud half of the failure this table prevents.
+    assert hasattr(cls.config_class, "__name__")
+    src = __import__("inspect").getsource(cls.__init__)
+    assert "self.model" in src
+
+
+def test_text_tower_table_covers_the_text_only_variants():
+    """Both the wrapper and `*_text` forms must map, since `get_text_config()` on an
+    already-unwrapped checkpoint reports the text type."""
+    for base in ("qwen3_5", "gemma4", "gemma4_unified"):
+        assert TEXT_TOWER_CLASSES[base] == TEXT_TOWER_CLASSES[f"{base}_text"]

@@ -50,11 +50,13 @@ from .infer import EngineConfig, SystemOneEngine
 from .modeling import (
     StrandsDeciderConfig,
     StrandsDeciderModel,
+    assert_bos_contract,
     base_revision,
     build_head,
     checkpoint_dir,
     config_path,
     load_head_state,
+    load_text_tower,
 )
 
 
@@ -75,11 +77,12 @@ def load_merged_torso(
     *,
     attn_implementation: str | None = None,
 ) -> nn.Module:
-    """Load a plain (already-merged) Qwen3.5 directory as a bare torso.
+    """Load a plain (already-merged) directory as a bare torso.
 
-    Mirrors `StrandsDeciderModel._load_torso` deliberately, including the Qwen3.5 branch:
-    those checkpoints are multimodal, so `AutoModel` would hand back the wrapper with its
-    vision tower attached. `serving/merge_lora.py` writes the same shape, and the two must
+    Shares `modeling.load_text_tower` with `StrandsDeciderModel._load_torso` and
+    `serving/merge_lora.py` rather than mirroring them by hand: every base this serves is
+    a multimodal checkpoint, so `AutoModel` would hand back the wrapper with its vision
+    tower attached. `serving/merge_lora.py` writes the same shape, and the two must
     agree -- a name mismatch there makes PEFT report an *empty* merge rather than an error.
     """
     from transformers import AutoConfig, AutoModel
@@ -89,15 +92,7 @@ def load_merged_torso(
         kwargs["attn_implementation"] = attn_implementation
 
     base_cfg = AutoConfig.from_pretrained(merged_torso)
-    if base_cfg.model_type in {"qwen3_5", "qwen3_5_text"}:
-        import transformers
-
-        lm = transformers.Qwen3_5ForCausalLM.from_pretrained(
-            merged_torso, config=base_cfg.get_text_config(), **kwargs
-        )
-        torso = lm.model
-    else:
-        torso = AutoModel.from_pretrained(merged_torso, **kwargs)
+    torso = load_text_tower(merged_torso, base_cfg, AutoModel, **kwargs)
     torso.config.use_cache = True
     return torso
 
@@ -171,6 +166,9 @@ def build_merged_model(
     tok = AutoTokenizer.from_pretrained(ckpt)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
+    # Before serving, not on the first request: a checkpoint that asserts force_bos and a
+    # tokeniser that will not supply one is a startup failure, not a per-request one.
+    assert_bos_contract(config, tok)
     obj.tokenizer = tok
     return obj
 
