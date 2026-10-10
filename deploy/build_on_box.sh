@@ -23,6 +23,19 @@
 #   HF_TOKEN  passed as a BuildKit secret if set (never lands in an image layer -- but it
 #             DOES land in SSM command history, see the warning below)
 #   TRITON_IMAGE  base image override, passed through as a --build-arg
+#   SD_CHECKPOINT_REPO      checkpoint to bake in, passed through as a --build-arg
+#   SD_CHECKPOINT_REVISION  that checkpoint's Hub revision, likewise
+#
+# SD_CHECKPOINT_REPO is how you build an image for a model other than the Dockerfile's
+# default. Until this was added the ARG existed in Dockerfile.triton but no supported build
+# path forwarded it, so changing checkpoint meant editing the Dockerfile -- and then the
+# image tag and the baked weights could disagree with nothing to catch it. Both are left
+# EMPTY by default so the Dockerfile's own ARG stays the single source of truth for the
+# default build; only an explicitly set value is forwarded.
+#
+# Tag the result for the model it contains. One ECR repo holds every image and the DLC
+# launcher is single-model (SAGEMAKER_SINGLE_MODEL_REPO), so one image serves exactly one
+# checkpoint: a tag like `v25-qwen3.5-v1` is the only thing that will tell you which.
 #
 # TRITON_IMAGE matters more than a normal override: the base image's CUDA major version
 # decides which SageMaker instance families the result can be hosted on. The 26.05 and
@@ -58,6 +71,19 @@ REPO="${REPO:-strands-decider-serving}"
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 TRITON_IMAGE="${TRITON_IMAGE:-763104351884.dkr.ecr.us-west-2.amazonaws.com/sagemaker-tritonserver:25.04-py3}"
 
+# Deliberately NOT defaulted: an empty value forwards no --build-arg at all, which leaves
+# Dockerfile.triton's own ARG authoritative. Defaulting them here would duplicate the
+# default in two files that can drift.
+SD_CHECKPOINT_REPO="${SD_CHECKPOINT_REPO:-}"
+SD_CHECKPOINT_REVISION="${SD_CHECKPOINT_REVISION:-}"
+CKPT_ARGS=""
+if [ -n "$SD_CHECKPOINT_REPO" ]; then
+    CKPT_ARGS="--build-arg SD_CHECKPOINT_REPO=${SD_CHECKPOINT_REPO}"
+fi
+if [ -n "$SD_CHECKPOINT_REVISION" ]; then
+    CKPT_ARGS="${CKPT_ARGS} --build-arg SD_CHECKPOINT_REVISION=${SD_CHECKPOINT_REVISION}"
+fi
+
 ACCOUNT="$(aws sts get-caller-identity --query Account --output text --region "$REGION")"
 BUCKET="${BUCKET:-hobson-v17-${ACCOUNT}-${REGION}}"
 REGISTRY="${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com"
@@ -68,6 +94,7 @@ echo "==> context  : $HERE"
 echo "==> bucket   : s3://${BUCKET}/${PREFIX}/"
 echo "==> image    : ${REGISTRY}/${REPO}:${TAG}"
 echo "==> base     : ${TRITON_IMAGE}"
+echo "==> ckpt     : ${SD_CHECKPOINT_REPO:-(Dockerfile default)} @ ${SD_CHECKPOINT_REVISION:-(Dockerfile default)}"
 echo "==> builder  : ${BOX_ID} (${REGION})"
 
 # Only what the Dockerfile actually reads. Keeping this explicit rather than syncing the
@@ -165,6 +192,7 @@ DOCKER_BUILDKIT=1 docker build \
   --platform linux/amd64 \
   -f /tmp/ctx/deploy/Dockerfile.triton \
   --build-arg TRITON_IMAGE=${TRITON_IMAGE} \
+  ${CKPT_ARGS} \
   ${SECRET_ARG} \
   --output type=image,name=${REGISTRY}/${REPO}:${TAG},push=true,oci-mediatypes=false \
   --provenance=false \

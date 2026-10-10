@@ -238,6 +238,20 @@ TRITON_IMAGE=763104351884.dkr.ecr.us-west-2.amazonaws.com/sagemaker-tritonserver
 checkpoint repo requires one (it is passed as a BuildKit secret and never lands in a
 layer).
 
+**Building a different model.** `SD_CHECKPOINT_REPO` and `SD_CHECKPOINT_REVISION` pick the
+checkpoint baked into the image; unset, `Dockerfile.triton`'s own `ARG` stays authoritative:
+
+```bash
+SD_CHECKPOINT_REPO=StrandsAgents/strands-decider-2B-qwen3.5-v1-2610 \
+  deploy/build_on_box.sh v25-qwen3.5-v1
+```
+
+or, end to end, `deploy/up.py --build --box-id <id> --checkpoint-repo <hub-id> --tag <tag>`.
+**Tag the image for the model it contains.** One image serves exactly one checkpoint — the
+weights are baked in and the DLC launcher is single-model — so the tag is the only thing
+that records which, and `up.py` refuses `--checkpoint-repo` without `--build` rather than
+bringing up an endpoint serving whatever that tag already held.
+
 **`TRITON_IMAGE` must be a CUDA 12 tag.** `25.04-py3` is CUDA 12.9. The newer DLC tags
 (`25.09`, `26.03`–`26.05`) are CUDA 13 and cannot be placed on every GPU fleet — some
 SageMaker hosts carry NVIDIA drivers as old as `470.256.02`, below the minimum for any
