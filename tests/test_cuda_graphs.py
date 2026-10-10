@@ -147,12 +147,31 @@ def test_admits_two_pass_at_each_boundary():
     assert not admits_two_pass(state_lens=[64], row_lens=[])
 
 
-def test_the_bank_can_hold_any_state_the_window_admits():
-    """`BANK_WIDTH` below the model's context window would mean a legal request whose state
-    cannot be stored, which is a shape bug rather than a tuning choice."""
-    from strands_decider.modeling import StrandsDeciderConfig
+def test_the_bank_can_hold_any_state_it_will_be_asked_to_graph():
+    """The bank must hold any state that is actually graphed, i.e. `BANK_WIDTH >=
+    GRAPH_STATE`. A state between the two is refused by `admits_two_pass` and runs eager,
+    which is safe.
 
-    assert BANK_WIDTH >= StrandsDeciderConfig().max_length
+    This replaces an assertion against `StrandsDeciderConfig().max_length`, which passed
+    vacuously: it read the DATACLASS DEFAULT of 3072 and so compared BANK_WIDTH to itself.
+    Every checkpoint actually shipped -- v21 and all five of the 2610 releases -- sets
+    max_length 4096, so the invariant the old test claimed to pin ("the bank covers the
+    whole context window") has been false the entire time and nothing noticed. Pin the
+    invariant the code really relies on instead, and pin it against a constant the test
+    cannot accidentally read from the thing under test.
+    """
+    assert BANK_WIDTH >= GRAPH_STATE
+    # Non-vacuous by construction: a state longer than the bank must be refused outright,
+    # whatever max_length permits, because there is nowhere to put it.
+    assert not admits_two_pass(state_lens=[BANK_WIDTH + 1], row_lens=[32])
+
+
+def test_a_state_the_bank_cannot_hold_is_refused_not_truncated():
+    """The published checkpoints allow a 4096-token state and the bank holds 3072. The
+    gap must be refused rather than silently clipped: a clipped state is a confidently
+    wrong probability at HTTP 200, which is the failure mode this repo keeps paying for."""
+    for state_len in (BANK_WIDTH + 1, 4096):
+        assert not admits_two_pass(state_lens=[state_len], row_lens=[32])
 
 
 # ---------------------------------------------------------------------------

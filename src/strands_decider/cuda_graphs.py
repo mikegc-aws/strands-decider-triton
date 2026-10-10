@@ -162,8 +162,16 @@ import torch
 GRAPH_STATES = 8      # distinct states one state pass may hold = bank entries. Triton
                       # coalesces at most `max_batch_size` (8) requests, so 8 covers a
                       # full batch even with no state shared between callers.
-BANK_WIDTH = 3072     # positions per bank entry, states right-aligned. = max_length, so a
-                      # state that fits the window fits the bank.
+BANK_WIDTH = 3072     # positions per bank entry, states right-aligned. It bounds what the
+                      # bank can STORE, not what the model accepts: every published
+                      # checkpoint sets max_length 4096, so this is BELOW the context
+                      # window and the comment here used to claim they were equal.
+                      # Harmless, and deliberately left at 3072 rather than raised: the
+                      # binding limit is GRAPH_STATE (1024), so a state between 1024 and
+                      # 4096 is refused by `admits_two_pass` and runs eager either way.
+                      # Raising this to 4096 would cost a third more bank memory to store
+                      # states that are never graphed. The invariant that must hold is
+                      # BANK_WIDTH >= GRAPH_STATE; see test_cuda_graphs.py.
 GRAPH_STATE = 1024    # longest state bucket graphed. Beyond it a state pass is
                       # compute-bound (1024 x 0.0935 ms ~ 96 ms against the 45 ms floor).
 GRAPH_ROW = 256       # longest question-row bucket graphed. Questions are tens of tokens;
