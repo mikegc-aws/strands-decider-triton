@@ -80,6 +80,24 @@ class StrandsDeciderConfig:
     lora_r: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.05
+    # --- fields the gemma4-2610 checkpoints publish -------------------------------------
+    # Declared so those configs parse at all: `from_json` is `cls(**json.load(fh))`, so an
+    # undeclared key is a TypeError in the Docker merge stage. The 2B-qwen3.5-v1-2610
+    # publisher stripped these three because each held its off value; the gemma4 configs
+    # do NOT, so they are declared with the semantics stated rather than dropped.
+    #
+    # `full_weight_targets` and `host_embeddings` are training-side and inert at inference:
+    # the first names modules trained at full rank instead of through LoRA (already baked
+    # into the merged torso by the time anything here runs), the second is a training
+    # memory trade. Carried so they round-trip, read by nothing.
+    full_weight_targets: list[str] = field(default_factory=list)
+    host_embeddings: bool = False
+    # `force_bos` is NOT inert. It is `true` on all four gemma4 checkpoints and asserts
+    # that the sequence begins with the tokeniser's BOS token. Nothing here used to read
+    # it, and the state happens to get one because `infer.py` tokenises it with
+    # `add_special_tokens=True` -- but that is a property of the tokeniser, not a promise
+    # this code was keeping. `assert_bos_contract` turns it into one.
+    force_bos: bool = False
     lora_targets: list[str] = field(
         default_factory=lambda: [
             "q_proj", "k_proj", "v_proj", "o_proj",
@@ -94,6 +112,117 @@ class StrandsDeciderConfig:
     def from_json(cls, path: str) -> StrandsDeciderConfig:
         with open(path, encoding="utf-8") as fh:
             return cls(**json.load(fh))
+
+
+# `model_type` -> the causal-LM class whose `.model` is the text tower we want.
+#
+# Every base this project serves is a MULTIMODAL checkpoint, so `AutoModel` hands back a
+# wrapper with vision (and for gemma4, audio) towers attached. That is wrong in three
+# separate ways and only one of them is loud:
+#
+#   1. the wrapper's config has no top-level `hidden_size` -- only `text_config` does --
+#      so `hidden_size()` raises and the head cannot be built. This is the loud one.
+#   2. the decoder stack sits at `language_model.layers.N` rather than `layers.N`, while
+#      every published adapter targets `base_model.model.layers.N`. PEFT reports a total
+#      name mismatch as an EMPTY MERGE rather than an error, so the silent outcome is an
+#      un-adapted base model that still answers.
+#   3. the vision and audio towers carry modules named `q_proj`/`k_proj`/`v_proj`/`o_proj`
+#      too, so they would satisfy `merge_lora.py`'s "no weight matched target_modules"
+#      guard while the layers that matter went unadapted.
+#
+# Loading through the causal-LM class and keeping `.model` gives the text tower, with its
+# text config and its layers at `.layers`. The output head is dropped: it is tied to the
+# input embeddings, which the KL reference reads instead.
+#
+# A table rather than a third copy of the same `if`. This branch previously existed in
+# three files whose comments each said they must mirror the others exactly -- and adding
+# gemma4 meant editing all three in step, which is the kind of invariant a table keeps and
+# prose does not.
+TEXT_TOWER_CLASSES: dict[str, str] = {
+    "qwen3_5": "Qwen3_5ForCausalLM",
+    "qwen3_5_text": "Qwen3_5ForCausalLM",
+    # gemma4 covers E2B, E4B and 26B-A4B; 12B is `gemma4_unified`, a separate class.
+    "gemma4": "Gemma4ForCausalLM",
+    "gemma4_text": "Gemma4ForCausalLM",
+    "gemma4_unified": "Gemma4UnifiedForCausalLM",
+    "gemma4_unified_text": "Gemma4UnifiedForCausalLM",
+}
+
+
+def load_text_tower_lm(
+    source: str, base_cfg: Any, auto_model: Any, **kwargs: Any
+) -> tuple[nn.Module, Any | None]:
+    """Load `source`'s decoder stack; return `(torso, causal_lm_wrapper_or_None)`.
+
+    `source` is a Hub id or a local directory; `base_cfg` its already-loaded config;
+    `auto_model` the `AutoModel` class to fall back to for architectures not in
+    `TEXT_TOWER_CLASSES`. Extra kwargs go to `from_pretrained`.
+
+    The wrapper is returned because `serving/merge_lora.py` needs to put the merged torso
+    back into it before `save_pretrained`, so the written directory carries the same
+    architecture the loaders expect to read. Callers that only serve want
+    `load_text_tower`.
+
+    The fallback is deliberately still `AutoModel`: an architecture nobody has checked
+    should behave as it did before this table existed, rather than guess at a text-tower
+    class name that may not exist.
+    """
+    import transformers
+
+    cls_name = TEXT_TOWER_CLASSES.get(base_cfg.model_type)
+    if cls_name is None:
+        return auto_model.from_pretrained(source, **kwargs), None
+
+    cls = getattr(transformers, cls_name, None)
+    if cls is None:
+        # Named but absent: the installed transformers is older than this table. Refuse,
+        # because the AutoModel fallback here would load a wrapper whose adapter names do
+        # not line up and merge nothing -- failure mode 2 above, silently.
+        raise RuntimeError(
+            f"{base_cfg.model_type!r} needs transformers.{cls_name}, which this "
+            f"transformers ({transformers.__version__}) does not provide. Loading it "
+            "through AutoModel instead would merge the adapter into nothing and still "
+            "answer, so this refuses rather than falling back."
+        )
+    lm = cls.from_pretrained(source, config=base_cfg.get_text_config(), **kwargs)
+    return lm.model, lm
+
+
+def load_text_tower(source: str, base_cfg: Any, auto_model: Any, **kwargs: Any) -> nn.Module:
+    """`load_text_tower_lm` for callers that do not need the causal-LM wrapper."""
+    torso, _ = load_text_tower_lm(source, base_cfg, auto_model, **kwargs)
+    return torso
+
+
+def assert_bos_contract(config: StrandsDeciderConfig, tokenizer: Any) -> None:
+    """Hold `force_bos` to its word, or refuse to serve.
+
+    `force_bos: true` on all four gemma4-2610 checkpoints asserts the sequence begins with
+    BOS. `infer.py` tokenises the state with `add_special_tokens=True`, so a tokeniser that
+    prepends BOS satisfies it -- but that is a property of the tokeniser, and the flag was
+    being honoured by coincidence rather than by anything in this code.
+
+    So check it once, at load, against the real tokeniser: encode a probe and require BOS
+    at position 0. Cheap, and it converts "probably fine" into either a guarantee or a
+    startup failure. A served model answering without a token its checkpoint requires is
+    the silent-wrongness shape this project keeps paying for.
+    """
+    if not config.force_bos:
+        return
+    bos_id = getattr(tokenizer, "bos_token_id", None)
+    if bos_id is None:
+        raise RuntimeError(
+            "the checkpoint sets force_bos but its tokeniser declares no bos_token_id, so "
+            "the contract cannot be satisfied. Either the config or the tokeniser is wrong."
+        )
+    ids = tokenizer("probe", add_special_tokens=True)["input_ids"]
+    if not ids or ids[0] != bos_id:
+        raise RuntimeError(
+            f"the checkpoint sets force_bos, but tokenising with add_special_tokens=True "
+            f"produced {ids[:4]} rather than starting with bos_token_id={bos_id}. The "
+            "state would reach the model without the leading token the checkpoint "
+            "requires, which changes every probability and would not raise anywhere else."
+        )
 
 
 class SlotHead(nn.Module):
@@ -290,19 +419,7 @@ class StrandsDeciderModel(nn.Module):
         if attn_implementation:
             kwargs["attn_implementation"] = attn_implementation
         base_cfg = AutoConfig.from_pretrained(config.base_model, revision=config.base_revision)
-        if base_cfg.model_type in {"qwen3_5", "qwen3_5_text"}:
-            # Qwen3.5 checkpoints are multimodal; AutoModel would hand back the wrapper with
-            # a vision tower. Load the text tower through its causal-LM class, which maps the
-            # checkpoint's weight names, and keep only the decoder (the output head is tied to
-            # the input embeddings, which the KL reference reads instead).
-            import transformers
-
-            lm = transformers.Qwen3_5ForCausalLM.from_pretrained(
-                config.base_model, config=base_cfg.get_text_config(), **kwargs
-            )
-            torso = lm.model
-        else:
-            torso = AutoModel.from_pretrained(config.base_model, **kwargs)
+        torso = load_text_tower(config.base_model, base_cfg, AutoModel, **kwargs)
         torso.config.use_cache = True
         return torso
 

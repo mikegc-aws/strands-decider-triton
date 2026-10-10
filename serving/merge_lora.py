@@ -30,7 +30,6 @@ import sys
 from pathlib import Path
 
 import torch
-import transformers
 from peft import PeftModel
 from transformers import AutoConfig, AutoModel
 
@@ -38,6 +37,7 @@ from strands_decider.modeling import (
     StrandsDeciderConfig,
     base_revision,
     config_path,
+    load_text_tower_lm,
 )
 
 
@@ -50,18 +50,13 @@ def main(checkpoint: str, out: str) -> int:
     kwargs = {"dtype": getattr(torch, config.torch_dtype), "revision": revision}
     base_cfg = AutoConfig.from_pretrained(config.base_model, revision=revision)
 
-    # Mirror StrandsDeciderModel._load_torso exactly. If the torso were loaded any other
-    # way the adapter's module names would not line up, and PEFT reports that as an empty
-    # merge rather than an error -- which would silently produce an un-adapted model that
-    # still answers, i.e. the worst possible outcome.
-    if base_cfg.model_type in {"qwen3_5", "qwen3_5_text"}:
-        lm = transformers.Qwen3_5ForCausalLM.from_pretrained(
-            config.base_model, config=base_cfg.get_text_config(), **kwargs
-        )
-        torso = lm.model
-    else:
-        lm = None
-        torso = AutoModel.from_pretrained(config.base_model, **kwargs)
+    # Shares `load_text_tower_lm` with StrandsDeciderModel._load_torso and
+    # merged_engine.load_merged_torso. If the torso were loaded any other way the adapter's
+    # module names would not line up, and PEFT reports that as an empty merge rather than
+    # an error -- which would silently produce an un-adapted model that still answers,
+    # i.e. the worst possible outcome. That is exactly why the three sites now read one
+    # table instead of three hand-mirrored copies of the same `if`.
+    torso, lm = load_text_tower_lm(config.base_model, base_cfg, AutoModel, **kwargs)
 
     adapter = Path(checkpoint) / "lora"
     if not adapter.is_dir():
