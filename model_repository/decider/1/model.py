@@ -206,8 +206,51 @@ class TritonPythonModel:
             f"[decider] {engine_kind} engine loaded in {time.perf_counter() - started:.1f}s "
             f"(prefix_cache={prefix_cache}, device={device}, fused_layers={fuse_layers})"
         )
+        self._assert_graphs_honoured(cuda_graphs)
         if param("SD_WARMUP", "1") not in ("0", "false", "no", "off"):
             self._warmup()
+
+    def _assert_graphs_honoured(self, requested: bool) -> None:
+        """Refuse to start if `SD_CUDA_GRAPHS` was asked for and cannot be delivered.
+
+        `_engine_kwargs` already refuses an option the loader's SIGNATURE will not take.
+        This closes the other door: a loader that ACCEPTS `cuda_graphs=True` and then
+        cannot honour it. `BatchedSystemOneEngine.graphs()` catches everything, prints one
+        line to stdout and sets `self._graphs = None`, so the endpoint comes up healthy
+        and serves the eager path for ever -- and `_log_graph_stats` then returns early on
+        the empty dict, meaning the one signal designed to distinguish a graphed server
+        from a fallen-back one prints NOTHING AT ALL.
+
+        That is the same failure that cost a deploy on v23 with `SD_FUSE_LAYERS=1` (see
+        README "Known limits"): a knob read by nothing, a healthy endpoint, and throughput
+        numbers two agents in a row believed. The fix there was `_engine_kwargs`; it does
+        not cover this case, so cover it here on the same principle -- an option turned ON
+        that cannot be honoured RAISES rather than degrading quietly.
+
+        The concrete way in: a torso whose cache layers are not the layout
+        `cuda_graphs` supports. Every Gemma-4 checkpoint released on 2026-10-09 is such a
+        torso -- `DynamicSlidingWindowLayer` is a subclass of `DynamicLayer`, so the
+        `type(layer) is DynamicLayer` guard rejects it and `GraphsUnavailable` is raised
+        inside `graphs()`, where it is swallowed.
+        """
+        if not requested:
+            return
+        getter = getattr(self.engine, "graphs", None)
+        if getter is None:
+            raise pb_utils.TritonModelException(
+                "SD_CUDA_GRAPHS was set but this engine has no `graphs()`, so the "
+                "setting is read by nothing. Use SD_ENGINE=merged, or unset "
+                "SD_CUDA_GRAPHS rather than serving the eager path under its name."
+            )
+        if getter() is None:
+            raise pb_utils.TritonModelException(
+                "SD_CUDA_GRAPHS was set but graph capture is unavailable on this torso "
+                "or device, so the server would serve the EAGER path under an "
+                "accelerated name and no later log line would say so. The reason was "
+                "printed by `graphs()` above as 'cuda graphs unavailable (...)' -- read "
+                "it, because it names the layout or device that was refused. Unset "
+                "SD_CUDA_GRAPHS to serve eager deliberately."
+            )
 
     def _engine_kwargs(self, loader, optional: dict) -> dict:
         """Keep only the optional kwargs `loader` actually accepts.
@@ -459,7 +502,23 @@ class TritonPythonModel:
     def _log_graph_stats(self, n: int) -> None:
         stats = getattr(self.engine, "graph_stats", dict)()
         if not stats:
+            # An empty dict is ambiguous and used to be treated as "graphs are off, say
+            # nothing". It is also what a server that HAD graphs and lost them reports:
+            # `_disable_graphs` drops `_graphs` after a failed pass and serves eager for
+            # the rest of the process. `_assert_graphs_honoured` cannot catch that -- it
+            # runs at load, and this happens under traffic -- so say it once here.
+            if getattr(self, "_had_graphs", False):
+                self._had_graphs = False
+                self.logger.log_warn(
+                    "[decider] cuda graphs were active and are now reporting no stats; "
+                    "the engine has fallen back to the eager path for the rest of this "
+                    "process (see the `cuda graph pass failed` traceback above). Answers "
+                    "stay correct; latency regresses to the eager figures, so do not "
+                    "compare throughput measured after this line with figures from "
+                    "before it."
+                )
             return
+        self._had_graphs = True
         self._seen = getattr(self, "_seen", 0) + n
         if self._seen >= getattr(self, "_next_stats", 0):
             self._next_stats = self._seen + self.GRAPH_STATS_EVERY

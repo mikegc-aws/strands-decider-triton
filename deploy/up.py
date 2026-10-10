@@ -357,6 +357,16 @@ def main() -> int:
     ap.add_argument("--box-id", default=os.environ.get("BOX_ID", ""),
                     help="in-region amd64 GPU instance to build on; required with --build")
     ap.add_argument("--tag", default="v23-triton-onepass")
+    # Forwarded to build_on_box.sh, which forwards them to Dockerfile.triton's ARGs. Empty
+    # means "whatever the Dockerfile defaults to", so the default build is unchanged.
+    # Only meaningful with --build: the checkpoint is baked into the image at build time,
+    # so pointing an EXISTING image at another checkpoint is not a thing you can do.
+    ap.add_argument("--checkpoint-repo", default="",
+                    help="Hub id of the checkpoint to bake in, e.g. "
+                         "StrandsAgents/strands-decider-2B-qwen3.5-v1-2610. Needs --build; "
+                         "tag the result for the model (one image serves one checkpoint)")
+    ap.add_argument("--checkpoint-revision", default="",
+                    help="Hub revision of --checkpoint-repo. Needs --build")
     ap.add_argument("--repo", default=DEFAULT_REPO)
     ap.add_argument("--bucket", default="", help="build-context bucket; defaulted per account")
     ap.add_argument("--down", action="store_true", help="delete what this created")
@@ -399,9 +409,25 @@ def main() -> int:
                 "    --query 'Reservations[].Instances[].[InstanceId,InstanceType]' "
                 "--output text")
         ensure_build_bucket(args.region, bucket)
-        run([str(HERE / "build_on_box.sh"), args.tag],
-            env={"BOX_ID": args.box_id, "REGION": args.region,
-                 "BUCKET": bucket, "REPO": args.repo})
+        build_env = {"BOX_ID": args.box_id, "REGION": args.region,
+                     "BUCKET": bucket, "REPO": args.repo}
+        # Only set when non-empty: build_on_box.sh forwards a --build-arg per variable it
+        # sees, and an empty one would override the Dockerfile's ARG with an empty string.
+        if args.checkpoint_repo:
+            build_env["SD_CHECKPOINT_REPO"] = args.checkpoint_repo
+        if args.checkpoint_revision:
+            build_env["SD_CHECKPOINT_REVISION"] = args.checkpoint_revision
+        run([str(HERE / "build_on_box.sh"), args.tag], env=build_env)
+    elif args.checkpoint_repo or args.checkpoint_revision:
+        # Fail rather than ignore it. The checkpoint is baked into the image, so without
+        # --build these flags describe a build that is not happening and the endpoint would
+        # come up serving whatever the named tag already contains -- a silent mismatch
+        # between what you asked for and what answers.
+        raise SystemExit(
+            "--checkpoint-repo/--checkpoint-revision only apply with --build: the "
+            "checkpoint is baked into the image, so selecting one means building one. "
+            f"Either add --build --box-id <id>, or drop the flag and accept whatever "
+            f"{image} already contains.")
 
     if args.role and args.model_data_url:
         # Not modified here on purpose: a role passed in belongs to the operator, and

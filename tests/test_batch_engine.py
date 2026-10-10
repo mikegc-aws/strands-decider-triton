@@ -106,6 +106,36 @@ def test_gather_refuses_an_unknown_tensor_rather_than_guessing():
         _gather_layered_cache(cache, torch.tensor([0, 1]))
 
 
+def test_gather_refuses_a_real_sliding_window_layer():
+    """A sliding-window attention cache must be refused, not forked.
+
+    The test above proves the refusal mechanism works, but it invents a tensor called
+    `mystery`. Nothing in this suite had ever handed `_gather_layered_cache` a cache layer
+    that transformers actually builds, so the suite would have passed unchanged against a
+    torso whose cache cannot be forked at all -- which is every Gemma-4 model (all four of
+    the 2610 releases are sliding/full softmax attention with ZERO recurrent layers, where
+    today's Qwen3.5 torso has 18).
+
+    `DynamicSlidingWindowLayer` is a SUBCLASS of `DynamicLayer`, so an `isinstance` check
+    waves it through; it carries `_sliding_window_tensor` (a tensor that is a constant, not
+    row state) and `cumulative_length` (a per-LAYER scalar, not per-row). Forking it by
+    copying tensors row-wise would produce a confidently wrong probability rather than an
+    error, so the contract is to refuse and let the caller fall back.
+    """
+    cache_utils = pytest.importorskip("transformers.cache_utils")
+    layer = cache_utils.DynamicSlidingWindowLayer(sliding_window=512)
+    layer.keys = torch.zeros(2, 2, 3, 4)
+    layer.values = torch.zeros(2, 2, 3, 4)
+
+    # Guard the premise: if transformers ever makes this a non-subclass, the isinstance
+    # path changes and this test is no longer covering what it claims to.
+    assert isinstance(layer, cache_utils.DynamicLayer)
+    assert type(layer) is not cache_utils.DynamicLayer
+
+    with pytest.raises(UnforkableCache):
+        _gather_layered_cache(_Cache([layer]), torch.tensor([0, 1]))
+
+
 def test_gather_rejects_a_cache_without_layers():
     with pytest.raises(UnforkableCache, match="unsupported KV cache type"):
         _gather_layered_cache(object(), torch.tensor([0]))
